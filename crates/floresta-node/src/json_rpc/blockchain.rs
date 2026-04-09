@@ -24,6 +24,8 @@ use serde_json::json;
 use serde_json::Value;
 use tracing::debug;
 
+use super::res::GetBlockHeaderRes;
+use super::res::GetBlockHeaderVerboseRes;
 use super::res::GetBlockchainInfoRes;
 use super::res::GetTxOutProof;
 use super::res::JsonRpcError;
@@ -106,7 +108,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             at: u32,
         ) -> Result<u32, JsonRpcError> {
             let hash = provider.get_block_hash(at)?;
-            let block = provider.get_block_header(hash)?;
+            let block = provider.get_header(hash)?;
             Ok(block.time)
         }
 
@@ -302,7 +304,66 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 
     // getblockheader
-    pub(super) fn get_block_header(&self, hash: BlockHash) -> Result<Header, JsonRpcError> {
+    pub(super) async fn get_block_header(
+        &self,
+        hash: BlockHash,
+        verbose: bool,
+    ) -> Result<GetBlockHeaderRes, JsonRpcError> {
+        let header = self.get_header(hash)?;
+
+        if !verbose {
+            return Ok(GetBlockHeaderRes::Zero(serialize_hex(&header)));
+        }
+
+        let height = header.get_height(&self.chain)?;
+        let confirmations = header.get_confirmations(&self.chain)? as i64;
+        let median_time = header.calculate_median_time_past(&self.chain)?;
+        let chain_work = header.calculate_chain_work(&self.chain)?.to_string_hex();
+        let next_block_hash = header
+            .get_next_block_hash(&self.chain)?
+            .map(|hash| hash.to_string());
+
+        let bits = header.get_bits_hex();
+        let target = serialize_hex(&header.target().to_be_bytes());
+        let difficulty = header.target().difficulty_float();
+
+        let previous_blockhash = (header.prev_blockhash != BlockHash::all_zeros())
+            .then_some(header.prev_blockhash.to_string());
+
+        let genesis_hash = self.chain.get_block_hash(0).unwrap();
+        let n_tx = if hash == genesis_hash {
+            1
+        } else {
+            self.get_block_inner(hash)
+                .await
+                .map(|block| block.txdata.len() as u32)
+                .map_err(|err| match err {
+                    JsonRpcError::BlockNotFound => JsonRpcError::BlockDataUnavailable,
+                    other => other,
+                })?
+        };
+
+        Ok(GetBlockHeaderRes::One(Box::new(GetBlockHeaderVerboseRes {
+            hash: hash.to_string(),
+            confirmations,
+            height: height as i64,
+            version: header.version.to_consensus(),
+            version_hex: header.get_version_hex(),
+            merkle_root: header.merkle_root.to_string(),
+            time: header.time,
+            median_time,
+            nonce: header.nonce,
+            bits,
+            target,
+            difficulty,
+            chainwork: chain_work,
+            n_tx,
+            previous_blockhash,
+            next_blockhash: next_block_hash,
+        })))
+    }
+
+    pub(super) fn get_header(&self, hash: BlockHash) -> Result<Header, JsonRpcError> {
         self.chain
             .get_block_header(&hash)
             .map_err(|_| JsonRpcError::BlockNotFound)

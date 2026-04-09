@@ -3,6 +3,7 @@
 use core::fmt::Debug;
 
 use bitcoin::block::Header as BlockHeader;
+use bitcoin::consensus::encode::deserialize_hex;
 use bitcoin::BlockHash;
 use bitcoin::Txid;
 use corepc_types::v29::GetTxOut;
@@ -36,13 +37,21 @@ pub trait FlorestaRPC {
     /// This method returns the hash of the block at the given height. If the height is
     /// invalid, an error is returned.
     fn get_block_hash(&self, height: u32) -> Result<BlockHash>;
-    /// Returns the block header for the given block hash
+    /// Returns the block header for the given block hash.
     ///
-    /// This method returns the block header for the given block hash, as defined
-    /// in the Bitcoin protocol specification. A header contains the block's version,
-    /// the previous block hash, the merkle root, the timestamp, the difficulty target,
-    /// and the nonce.
-    fn get_block_header(&self, hash: BlockHash) -> Result<BlockHeader>;
+    /// Set `verbose` to `true` for the JSON response shape and `false` for raw
+    /// header hex, matching Bitcoin Core's `getblockheader` behavior.
+    fn get_block_header_with_verbosity(
+        &self,
+        hash: BlockHash,
+        verbose: bool,
+    ) -> Result<GetBlockHeader>;
+
+    /// Returns the block header for the given block hash decoded as a consensus header.
+    fn get_block_header_raw(&self, hash: BlockHash) -> Result<BlockHeader>;
+
+    /// Returns the block header for the given block hash in verbose mode.
+    fn get_block_header(&self, hash: BlockHash) -> Result<GetBlockHeaderRes>;
     /// Gets a transaction from the blockchain
     ///
     /// This method returns a transaction that's cached in our wallet. If the verbosity flag is
@@ -317,8 +326,30 @@ impl<T: JsonRPCClient> FlorestaRPC for T {
         self.call("getblockfilter", &[Value::Number(Number::from(height))])
     }
 
-    fn get_block_header(&self, hash: BlockHash) -> Result<BlockHeader> {
-        self.call("getblockheader", &[Value::String(hash.to_string())])
+    fn get_block_header_with_verbosity(
+        &self,
+        hash: BlockHash,
+        verbose: bool,
+    ) -> Result<GetBlockHeader> {
+        self.call(
+            "getblockheader",
+            &[Value::String(hash.to_string()), Value::Bool(verbose)],
+        )
+    }
+
+    fn get_block_header_raw(&self, hash: BlockHash) -> Result<BlockHeader> {
+        match self.get_block_header_with_verbosity(hash, false)? {
+            GetBlockHeader::Zero(header_hex) => deserialize_hex(&header_hex)
+                .map_err(|err| Error::InvalidBlockHeaderHex(err.to_string())),
+            GetBlockHeader::One(_) => Err(Error::UnexpectedGetBlockHeaderResponse),
+        }
+    }
+
+    fn get_block_header(&self, hash: BlockHash) -> Result<GetBlockHeaderRes> {
+        match self.get_block_header_with_verbosity(hash, true)? {
+            GetBlockHeader::One(header) => Ok(*header),
+            GetBlockHeader::Zero(_) => Err(Error::UnexpectedGetBlockHeaderResponse),
+        }
     }
 
     fn get_blockchain_info(&self) -> Result<GetBlockchainInfoRes> {

@@ -131,6 +131,39 @@ pub enum GetBlockRes {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum GetBlockHeaderRes {
+    Zero(String),
+    One(Box<GetBlockHeaderVerboseRes>),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GetBlockHeaderVerboseRes {
+    pub hash: String,
+    pub confirmations: i64,
+    pub height: i64,
+    pub version: i32,
+    #[serde(rename = "versionHex")]
+    pub version_hex: String,
+    #[serde(rename = "merkleroot")]
+    pub merkle_root: String,
+    pub time: u32,
+    #[serde(rename = "mediantime")]
+    pub median_time: u32,
+    pub nonce: u32,
+    pub bits: String,
+    pub target: String,
+    pub difficulty: f64,
+    pub chainwork: String,
+    #[serde(rename = "nTx")]
+    pub n_tx: u32,
+    #[serde(rename = "previousblockhash", skip_serializing_if = "Option::is_none")]
+    pub previous_blockhash: Option<String>,
+    #[serde(rename = "nextblockhash", skip_serializing_if = "Option::is_none")]
+    pub next_blockhash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RpcError {
     pub code: i32,
     pub message: String,
@@ -172,6 +205,9 @@ pub enum JsonRpcError {
 
     /// The requested block is not found in the blockchain
     BlockNotFound,
+
+    /// Header exists, but full block data is not currently available
+    BlockDataUnavailable,
 
     /// There is an error with the chain, e.g., if the chain is not synced or when the chain is not valid
     Chain,
@@ -244,6 +280,9 @@ impl Display for JsonRpcError {
             JsonRpcError::TxNotFound =>  write!(f, "Transaction not found"),
             JsonRpcError::InvalidDescriptor(e) =>  write!(f, "Invalid descriptor: {e}"),
             JsonRpcError::BlockNotFound =>  write!(f, "Block not found"),
+            JsonRpcError::BlockDataUnavailable => {
+                write!(f, "Block data unavailable, cannot determine nTx for this header")
+            }
             JsonRpcError::Chain => write!(f, "Chain error"),
             JsonRpcError::InvalidAddress => write!(f, "Invalid address"),
             JsonRpcError::Node(e) => write!(f, "Node error: {e}"),

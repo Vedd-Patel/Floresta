@@ -196,6 +196,39 @@ pub enum GetBlockRes {
     One(Box<GetBlockVerboseOne>),
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GetBlockHeaderRes {
+    pub hash: String,
+    pub confirmations: i64,
+    pub height: i64,
+    pub version: i32,
+    #[serde(rename = "versionHex")]
+    pub version_hex: String,
+    #[serde(rename = "merkleroot")]
+    pub merkle_root: String,
+    pub time: u32,
+    #[serde(rename = "mediantime")]
+    pub median_time: u32,
+    pub nonce: u32,
+    pub bits: String,
+    pub target: String,
+    pub difficulty: f64,
+    pub chainwork: String,
+    #[serde(rename = "nTx")]
+    pub n_tx: u32,
+    #[serde(rename = "previousblockhash", skip_serializing_if = "Option::is_none")]
+    pub previous_blockhash: Option<String>,
+    #[serde(rename = "nextblockhash", skip_serializing_if = "Option::is_none")]
+    pub next_blockhash: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum GetBlockHeader {
+    Zero(String),
+    One(Box<GetBlockHeaderRes>),
+}
+
 /// A confidence enum to auxiliate rescan timestamp values.
 ///
 /// Tells how much confidence you need for this rescan request. That is, the how conservative you want floresta to be when determining which block to start the rescan.
@@ -245,6 +278,12 @@ pub enum Error {
 
     /// The requested transaction output was not found
     TxOutNotFound,
+
+    /// Could not decode a raw getblockheader hex payload into a consensus header
+    InvalidBlockHeaderHex(String),
+
+    /// An unexpected getblockheader response shape was returned
+    UnexpectedGetBlockHeaderResponse,
 }
 
 impl From<serde_json::Error> for Error {
@@ -271,6 +310,12 @@ impl Display for Error {
             Error::InvalidVerbosity => write!(f, "invalid verbosity level"),
             Error::InvalidRescanVal => write!(f, "Invalid rescan values"),
             Error::TxOutNotFound => write!(f, "Transaction output was not found"),
+            Error::InvalidBlockHeaderHex(e) => {
+                write!(f, "invalid block header hex payload: {e}")
+            }
+            Error::UnexpectedGetBlockHeaderResponse => {
+                write!(f, "unexpected getblockheader response shape")
+            }
         }
     }
 }

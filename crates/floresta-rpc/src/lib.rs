@@ -7,6 +7,11 @@
 //! may be used either from command line or programmatically. This crate provides a
 //! ready-to-use library for interacting with florestad's json-rpc interface in your rust
 //! application.
+//!
+//! ## API note
+//! `get_block_header` returns the verbose Bitcoin Core-compatible response.
+//! If you need the raw consensus header, use `get_block_header_raw`, which
+//! calls `getblockheader` with `verbose=false` and decodes the returned hex.
 
 // cargo docs customization
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -43,6 +48,7 @@ mod tests {
 
     use crate::jsonrpc_client::Client;
     use crate::rpc::FlorestaRPC;
+    use crate::rpc_types::GetBlockHeader;
     use crate::rpc_types::GetBlockRes;
 
     struct Florestad {
@@ -227,8 +233,21 @@ mod tests {
 
         let blockhash = client.get_block_hash(0).expect("rpc not working");
         let block_header = client.get_block_header(blockhash).expect("rpc not working");
+        let block_header_raw = client
+            .get_block_header_raw(blockhash)
+            .expect("rpc not working");
+        let block_header_hex = client
+            .get_block_header_with_verbosity(blockhash, false)
+            .expect("rpc not working");
 
-        assert_eq!(block_header.block_hash(), blockhash);
+        assert_eq!(block_header.hash, blockhash.to_string());
+        assert_eq!(block_header_raw.block_hash(), blockhash);
+
+        let GetBlockHeader::Zero(block_header_hex) = block_header_hex else {
+            panic!("Expected non-verbose block header");
+        };
+
+        assert_eq!(block_header_hex.len(), 160);
     }
 
     #[test]
