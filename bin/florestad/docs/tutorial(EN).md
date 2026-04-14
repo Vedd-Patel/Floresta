@@ -55,7 +55,7 @@ or
 or
 
 ```bash
-cargo run --release -- -c config.toml --network signet run
+cargo run --release -- -c config.toml --network signet
 ```
 Where:
 

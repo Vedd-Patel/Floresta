@@ -101,6 +101,8 @@ pub trait FlorestaRPC {
     /// the peer's IP address, the peer's version, the peer's user agent, the transport protocol
     /// and the peer's current height.
     fn get_peer_info(&self) -> Result<Vec<PeerInfo>>;
+    /// Returns the number of peers currently connected to the node.
+    fn get_connection_count(&self) -> Result<usize>;
     /// Returns a block, given a block hash
     ///
     /// This method returns a block, given a block hash. If the verbosity flag is 0, the block
@@ -300,6 +302,10 @@ impl<T: JsonRPCClient> FlorestaRPC for T {
 
     fn get_peer_info(&self) -> Result<Vec<PeerInfo>> {
         self.call("getpeerinfo", &[])
+    }
+
+    fn get_connection_count(&self) -> Result<usize> {
+        self.call("getconnectioncount", &[])
     }
 
     fn get_best_block_hash(&self) -> Result<BlockHash> {

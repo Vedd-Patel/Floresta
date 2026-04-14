@@ -118,4 +118,11 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             .await
             .map_err(|_| JsonRpcError::Node("Failed to get peer information".to_string()))
     }
+
+    pub(crate) async fn get_connection_count(&self) -> Result<usize> {
+        self.node
+            .get_connection_count()
+            .await
+            .map_err(|_| JsonRpcError::Node("Failed to get connection count".to_string()))
+    }
 }

@@ -46,6 +46,12 @@ use crate::node_context::PeerId;
 use crate::p2p_wire::error::WireError;
 use crate::p2p_wire::peer::PeerMessages;
 
+/// How long do we keep the last invs to compute peer scores
+const MAX_INV_RETENTION_TIME: Duration = Duration::from_secs(60 * 60); // One hour
+
+/// Don't hold more than this many invs in `last_invs`
+const MAX_LAST_INVS: usize = 144; // Around one day worth of blocks
+
 #[derive(Debug, Clone)]
 pub struct RunningNode {
     pub(crate) last_address_rearrange: Instant,
@@ -323,7 +329,10 @@ where
 
         if *self.kill_signal.read().await {
             self.shutdown();
-            stop_signal.send(()).unwrap();
+            match stop_signal.send(()) {
+                Ok(_) => {}
+                Err(e) => error!("Stop signal receiver already dropped: {e:?}"),
+            }
             return;
         }
 
@@ -633,12 +642,16 @@ where
 
                     PeerMessages::NewBlock(block) => {
                         debug!("We got an inv with block {block} requesting it");
-                        self.context
-                            .last_invs
-                            .entry(block)
-                            .and_modify(|(when, peers)| {
+                        // This shouldn't happen under normal operation, but prevents worse-case
+                        // scenarios.
+                        if self.context.last_invs.len() >= MAX_LAST_INVS {
+                            self.context.last_invs.drain();
+                        }
+
+                        match self.context.last_invs.get_mut(&block) {
+                            Some((when, peers)) => {
                                 if peers.contains(&peer) {
-                                    return;
+                                    return Ok(());
                                 }
 
                                 // if it's been less than 5 seconds since we got the first inv message
@@ -646,28 +659,25 @@ where
                                 if when.elapsed() < Duration::from_secs(5) {
                                     peers.push(peer);
                                 }
-                            })
-                            .or_insert_with(|| (Instant::now(), Vec::new()));
+                            }
+
+                            None => {
+                                self.context.last_invs.retain(|_, (when, _)| when.elapsed() <= MAX_INV_RETENTION_TIME);
+                                self.context.last_invs.insert(block, (Instant::now(), vec![peer]));
+                            }
+                        }
+
+                        // Don't request a block twice
+                        let already_requested = self.inflight.contains_key(&InflightRequests::Blocks(block)) || self.blocks.contains_key(&block);
+                        if already_requested {
+                            return Ok(());
+                        }
 
                         if self.chain.get_block_header(&block).is_ok() {
                             return Ok(());
                         }
 
-                        if self.inflight.contains_key(&InflightRequests::Blocks(block)) {
-                            return Ok(());
-                        }
-
-                        let p = self
-                            .peers
-                            .get(&peer)
-                            .cloned()
-                            .ok_or(WireError::PeerNotFound)?;
-
-                        // if this is a utreexo peer, we should ask for the block if we don't
-                        // have it
-                        if p.services.has(service_flags::UTREEXO.into()) {
-                            self.handle_new_block(block, peer)?;
-                        }
+                        self.handle_new_block(block, peer)?;
                     }
 
                     PeerMessages::Block(block) => {
@@ -713,6 +723,18 @@ where
                         }
 
                         for header in headers.iter() {
+                            let block_hash = header.block_hash();
+
+                            // Don't request a block twice
+                            let already_requested = self.inflight.contains_key(&InflightRequests::Blocks(block_hash)) || self.blocks.contains_key(&block_hash);
+                            if already_requested {
+                                continue;
+                            }
+
+                            if self.chain.get_block_header(&block_hash).is_ok() {
+                                continue;
+                            }
+
                             self.chain.accept_header(*header)?;
 
                             self.send_to_peer(

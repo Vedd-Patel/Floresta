@@ -96,6 +96,9 @@ fn do_request(cmd: &Cli, client: Client) -> anyhow::Result<String> {
             serde_json::to_string_pretty(&client.get_block(hash, verbosity)?)?
         }
         Methods::GetPeerInfo => serde_json::to_string_pretty(&client.get_peer_info()?)?,
+        Methods::GetConnectionCount => {
+            serde_json::to_string_pretty(&client.get_connection_count()?)?
+        }
         Methods::Stop => serde_json::to_string_pretty(&client.stop()?)?,
         Methods::AddNode {
             node,
@@ -292,6 +295,15 @@ pub enum Methods {
     /// Returns information about the peers we are connected to
     #[command(name = "getpeerinfo")]
     GetPeerInfo,
+
+    #[doc = include_str!("../../../doc/rpc/getconnectioncount.md")]
+    #[command(
+        name = "getconnectioncount",
+        about = "Returns the number of connections to other nodes",
+        long_about = Some(include_str!("../../../doc/rpc/getconnectioncount.md")),
+        disable_help_subcommand = true
+    )]
+    GetConnectionCount,
 
     /// Returns the value associated with a UTXO, if it's still not spent.
     /// This function only works properly if we have the compact block filters

@@ -67,6 +67,9 @@ pub enum UserRequest {
     /// Return information about all connected peers.
     GetPeerInfo,
 
+    /// Return the number of connected peers.
+    GetConnectionCount,
+
     /// Add a peer to the node's peer list.
     ///
     /// This function will add this peer to a special list of peers such that, if we lose the
@@ -133,6 +136,9 @@ pub enum NodeResponse {
 
     /// A response containing a list of peer information.
     GetPeerInfo(Vec<PeerInfo>),
+
+    /// The number of connected peers
+    GetConnectionCount(usize),
 
     /// A response indicating whether a peer was successfully added.
     Add(bool),
@@ -306,6 +312,13 @@ impl NodeInterface {
         let val = self.send_request(UserRequest::GetPeerInfo).await?;
 
         extract_variant!(GetPeerInfo, val);
+    }
+
+    /// Returns the number of peers currently connected to the node
+    pub async fn get_connection_count(&self) -> Result<usize, oneshot::error::RecvError> {
+        let val = self.send_request(UserRequest::GetConnectionCount).await?;
+
+        extract_variant!(GetConnectionCount, val);
     }
 
     /// Pings all connected peers to check if they are alive.

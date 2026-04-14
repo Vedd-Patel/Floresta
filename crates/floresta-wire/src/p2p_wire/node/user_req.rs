@@ -90,6 +90,12 @@ where
                 return;
             }
 
+            UserRequest::GetConnectionCount => {
+                let count = self.connected_peers();
+                try_and_log!(responder.send(NodeResponse::GetConnectionCount(count)));
+                return;
+            }
+
             UserRequest::Add((addr, port, v2transport)) => {
                 let node_response = match self.handle_addnode_add_peer(addr, port, v2transport) {
                     Ok(_) => {

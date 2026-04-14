@@ -358,6 +358,11 @@ async fn handle_json_rpc_request(
             .await
             .map(|v| serde_json::to_value(v).unwrap()),
 
+        "getconnectioncount" => state
+            .get_connection_count()
+            .await
+            .map(|v| serde_json::to_value(v).unwrap()),
+
         "addnode" => {
             let node = get_string(&params, 0, "node")?;
             let command = get_string(&params, 1, "command")?;

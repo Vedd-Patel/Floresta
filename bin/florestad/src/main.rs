@@ -19,11 +19,10 @@
 mod cli;
 #[cfg(unix)]
 mod daemonize;
+mod logger;
 
 use std::env;
 use std::fs;
-use std::io;
-use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::exit;
 use std::sync::Arc;
@@ -38,16 +37,11 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio::time::timeout;
 use tracing::info;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::fmt;
-use tracing_subscriber::fmt::time::ChronoLocal;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Layer;
+use tracing::Level;
 
 #[cfg(unix)]
 use crate::daemonize::Daemon;
+use crate::logger::start_logger;
 
 fn main() {
     let params = Cli::parse();
@@ -110,17 +104,18 @@ fn main() {
         daemon.fork().expect("failed to daemonize");
     }
 
-    let mut _log_guard: Option<WorkerGuard> = None;
-    if config.log_to_stdout || config.log_to_file {
-        let dir = &config.data_dir;
+    let log_level = match config.debug {
+        true => Level::DEBUG,
+        false => Level::INFO,
+    };
 
-        // Initialize logging (stdout/file) per config and retain the file guard
-        _log_guard = init_logging(dir, config.log_to_file, config.log_to_stdout, config.debug)
-            .unwrap_or_else(|e| {
-                eprintln!("Logging file couldn't be created at {dir:?}: {e}");
-                exit(1);
-            });
-    }
+    // The guard must stay alive until the end of `main` to flush file logs when dropped.
+    let _logger_guard = start_logger(
+        &config.data_dir,
+        config.log_to_file,
+        config.log_to_stdout,
+        log_level,
+    );
 
     let _rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -162,11 +157,13 @@ fn main() {
         }
     });
 
-    // drop them outside the async block, so we won't cause a nested drop of the runtime
-    // due to the rpc server, causing a panic.
+    // Drop `florestad` and the runtime.
+    // They are dropped outside the async block to avoid a nested
+    // drop of the runtime due to the RPC server, which panics.
     drop(florestad);
     drop(_rt);
-    drop(_log_guard); // flush file logs on exit
+    // Flush logs to the file system when dropped.
+    drop(_logger_guard);
 }
 
 fn data_dir_path(dir: Option<String>, network: Network) -> String {
@@ -190,85 +187,6 @@ fn data_dir_path(dir: Option<String>, network: Network) -> String {
     }
 
     base.to_string_lossy().into_owned()
-}
-
-/// Set up the logger for `florestad`.
-///
-/// This logger will subscribe to `tracing` events, filter them according to the defined log
-/// level, and format them based on the output destination. Logs can be directed to `stdout`, a
-/// file, both, or neither.
-pub fn init_logging(
-    data_dir: &str,
-    log_to_file: bool,
-    log_to_stdout: bool,
-    debug: bool,
-) -> Result<Option<WorkerGuard>, io::Error> {
-    // Get the log level from `--debug`.
-    let log_level = if debug { "debug" } else { "info" };
-
-    // Try to build an `EnvFilter` from the `RUST_LOG` env variable, or fallback to `log_level`.
-    let log_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
-
-    // For the registry, also enable very verbose runtime traces so `tokio-console` works, but keep
-    // human outputs quiet via per-layer filters below.
-    #[cfg(feature = "tokio-console")]
-    let base_filter = EnvFilter::new(format!("{log_filter},tokio=trace,runtime=trace"));
-
-    #[cfg(not(feature = "tokio-console"))]
-    let base_filter = log_filter.clone();
-
-    // Validate the log file path.
-    if log_to_file {
-        let file_path = format!("{data_dir}/debug.log");
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file_path)?;
-    }
-
-    // Timer for log events.
-    let log_timer = ChronoLocal::new("%Y-%m-%d %H:%M:%S".to_string());
-
-    // Standard Output layer: human-friendly formatting and level; ANSI only on a real TTY.
-    let fmt_layer_stdout = log_to_stdout.then(|| {
-        fmt::layer()
-            .with_writer(io::stdout)
-            .with_ansi(IsTerminal::is_terminal(&io::stdout()))
-            .with_timer(log_timer.clone())
-            .with_target(true)
-            .with_level(true)
-            .with_filter(log_filter.clone())
-    });
-
-    // File layer: non-blocking writer. Keep the `WorkerGuard` so logs flush on drop.
-    let mut guard = None;
-    let fmt_layer_logfile = log_to_file.then(|| {
-        let file_appender = tracing_appender::rolling::never(data_dir, "debug.log");
-        let (non_blocking, file_guard) = tracing_appender::non_blocking(file_appender);
-        guard = Some(file_guard);
-
-        fmt::layer()
-            .with_writer(non_blocking)
-            .with_ansi(false)
-            .with_timer(log_timer)
-            .with_target(true)
-            .with_level(true)
-            .with_filter(log_filter.clone())
-    });
-
-    // Build the registry with its (possibly more permissive) base filter, then attach layers to it.
-    let registry = tracing_subscriber::registry().with(base_filter);
-
-    #[cfg(feature = "tokio-console")]
-    let registry = registry.with(console_subscriber::spawn());
-
-    registry
-        .with(fmt_layer_stdout)
-        .with(fmt_layer_logfile)
-        .init();
-
-    Ok(guard)
 }
 
 #[cfg(test)]
