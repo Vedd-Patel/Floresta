@@ -17,7 +17,7 @@ use rustreexo::stump::Stump;
 
 const DATA_DIR: &str = "./tmp-db";
 
-//test1
+//test12
 #[tokio::main]
 //test2
 async fn main() {
