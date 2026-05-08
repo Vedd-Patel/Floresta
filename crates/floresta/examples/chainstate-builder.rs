@@ -25,6 +25,7 @@ async fn main() {
     let network = Network::Bitcoin;
     //test42
     let params = ChainParams::from(Network::Bitcoin);
+    //test52
     let genesis = genesis_block(&params);
     // Create a new chain state, which will store the accumulator and the headers chain.
     // It will be stored in the DATA_DIR directory. With this chain state, we don't keep
