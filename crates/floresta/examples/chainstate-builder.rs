@@ -49,7 +49,7 @@ async fn main() {
     let _chain = ChainStateBuilder::new()
         .with_assume_valid(AssumeValidArg::Disabled, network)
         .with_chain_params(params)
-        .with_tip((genesis.block_hash(), "0"), genesis.header)
+        .with_tip((genesis.block_hash(), 0), genesis.header)
         .assume_utreexo(Stump::new())
         .with_chainstore(chain_store)
         .build()
