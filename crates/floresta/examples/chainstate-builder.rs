@@ -23,7 +23,7 @@ const DATA_DIR: &str = "./tmp-db";
 async fn main() {
     //test32
     let network = Network::Bitcoin;
-    //test4
+    //test42
     let params = ChainParams::from(Network::Bitcoin);
     let genesis = genesis_block(&params);
     // Create a new chain state, which will store the accumulator and the headers chain.
