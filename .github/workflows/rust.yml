@@ -12,6 +12,54 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test-each-commit:
+    name: Test ancestor commits
+    if: github.event_name == 'pull_request' && github.event.pull_request.commits > 1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - uses: taiki-e/install-action@cargo-hack
+
+      - uses: dtolnay/rust-toolchain@1.81.0
+        with:
+          components: clippy
+
+      - name: Install Boost
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-all-dev
+
+      - name: Run checks on each ancestor commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          mapfile -t COMMITS < <(git rev-list --reverse --no-merges "${BASE_SHA}..${HEAD_SHA}")
+
+          if [ "${#COMMITS[@]}" -le 1 ]; then
+            echo "No ancestor commits to check."
+            exit 0
+          fi
+
+          for SHA in "${COMMITS[@]}"; do
+            if [ "$SHA" = "$HEAD_SHA" ]; then
+              continue
+            fi
+
+            echo "::group::Checking commit $SHA"
+            git checkout --force "$SHA"
+            cargo build --release --bins --verbose
+            ./contrib/feature_matrix.sh test --verbose
+            ./contrib/feature_matrix.sh clippy '-- -D warnings'
+            echo "::endgroup::"
+          done
+
   linting:
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.sha == github.sha)
     runs-on: ubuntu-latest
