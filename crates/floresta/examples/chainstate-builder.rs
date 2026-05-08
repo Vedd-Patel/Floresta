@@ -18,6 +18,7 @@ use rustreexo::stump::Stump;
 const DATA_DIR: &str = "./tmp-db";
 
 #[tokio::main]
+//test1
 async fn main() {
     let network = Network::Bitcoin;
     let params = ChainParams::from(Network::Bitcoin);
