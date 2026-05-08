@@ -21,7 +21,7 @@ const DATA_DIR: &str = "./tmp-db";
 #[tokio::main]
 //test22
 async fn main() {
-    //test3
+    //test32
     let network = Network::Bitcoin;
     //test4
     let params = ChainParams::from(Network::Bitcoin);
