@@ -1,0 +1,47 @@
+name: Test Each Commit
+
+on:
+  pull_request:
+    branches:
+      - master
+
+concurrency:
+  group: test-each-commit-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test-each-commit:
+    if: github.event.pull_request.commits > 1
+    name: Test Each Commit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ github.event.pull_request.commits + 2 }}
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@1.81.0
+        with:
+          components: clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Boost
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libboost-all-dev
+
+      - name: Configure git identity for rebase
+        run: |
+          git config user.email "ci@floresta"
+          git config user.name "Floresta CI"
+
+      - name: Test each commit via git rebase --exec
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git log --oneline "$BASE_SHA" -1
+          git rebase --exec ".github/ci-test-each-commit-exec.sh" "$BASE_SHA"
