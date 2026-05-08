@@ -15,7 +15,7 @@ use floresta_chain::FlatChainStore;
 use floresta_chain::FlatChainStoreConfig;
 use rustreexo::stump::Stump;
 
-const DATA_DIR: &str = "./tmp-db";
+const DATA_DIR: &str = "./tmp-db-chainstate-builder";
 
 #[tokio::main]
 async fn main() {
