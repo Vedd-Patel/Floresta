@@ -71,5 +71,5 @@ jobs:
           fi
 
           git rebase \
-            --exec ".github/ci-test-each-commit-exec.sh" \
+            --exec "bash .github/ci-test-each-commit-exec.sh" \
             "$BEFORE_SHA"
