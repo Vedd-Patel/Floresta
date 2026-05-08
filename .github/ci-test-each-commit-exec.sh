@@ -8,5 +8,5 @@ echo "Testing commit: $(git log -1 --oneline)"
 echo "================================================"
 echo ""
 
-cargo build --workspace
-cargo test --workspace
+cargo build --workspace --release
+cargo test --workspace --release
