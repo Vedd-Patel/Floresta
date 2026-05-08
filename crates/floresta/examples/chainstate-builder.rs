@@ -20,6 +20,7 @@ const DATA_DIR: &str = "./tmp-db";
 #[tokio::main]
 //testing 1
 async fn main() {
+    //testing 2
     let network = Network::Bitcoin;
     let params = ChainParams::from(Network::Bitcoin);
     let genesis = genesis_block(&params);
