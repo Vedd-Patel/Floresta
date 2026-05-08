@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.event.pull_request.number }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_FUZZ_VERSION: 0.13.1
@@ -16,6 +20,7 @@ env:
 jobs:
   fuzz:
     name: Run Fuzzing Tests
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.sha == github.sha)
     runs-on: ubuntu-latest
 
     steps:

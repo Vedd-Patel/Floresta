@@ -4,11 +4,16 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.event.pull_request.number }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   linting:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.sha == github.sha)
     runs-on: ubuntu-latest
 
     steps:
@@ -41,6 +46,7 @@ jobs:
         shell: bash # Ensure the script runs using bash on all platforms
 
   cross-testing:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.sha == github.sha)
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
@@ -133,6 +139,7 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
   no-std:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.sha == github.sha)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -166,6 +173,7 @@ jobs:
             --locked
 
   build-docker:
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.sha == github.sha)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

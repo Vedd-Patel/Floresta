@@ -4,12 +4,17 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.event.pull_request.number }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   benchmark:
     name: Run Benchmarks
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.sha == github.sha)
     runs-on: ubuntu-latest
 
     steps:
