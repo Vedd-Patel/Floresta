@@ -69,6 +69,20 @@
 //! an infinite loop. If we are about to reach the map's capacity, we should re-hash with a new
 //! capacity.
 
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::map_err_ignore,
+    clippy::wildcard_enum_match_arm,
+    clippy::result_unit_err
+)]
+#![warn(clippy::result_large_err)]
+
 extern crate std;
 
 use core::error;
@@ -95,7 +109,6 @@ use std::sync::PoisonError;
 
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
-use floresta_common::impl_error_from;
 use floresta_common::prelude::*;
 use index_impl::Index;
 use lru::LruCache;
@@ -189,10 +202,10 @@ impl FlatChainStoreConfig {
         FlatChainStoreConfig {
             file_permission: Some(0o666),
             fork_file_size: Some(10_000),
+            path: path.as_ref().into(),
             headers_file_size: Some(10_000_000),
             block_index_size: Some(10_000_000),
             cache_size: Some(10_000),
-            path: path.as_ref().into(),
         }
     }
 }
@@ -233,7 +246,9 @@ enum IndexBucket {
 
 /// A simple index implementation with safe API
 mod index_impl {
-    use super::FlatChainstoreError;
+    use floresta_common::prelude::format;
+
+    use super::ChainstoreError;
 
     #[repr(transparent)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -253,20 +268,24 @@ mod index_impl {
         const INDEX_MASK: u32 = 0x7FFF_FFFF;
 
         /// Create a new mainchain entry (MSB is zero)
-        pub fn new(index: u32) -> Result<Self, FlatChainstoreError> {
+        pub fn new(index: u32) -> Result<Self, ChainstoreError> {
             if index >= Self::FORK_BIT {
                 // Index value is out of bounds for our 31-bit indexes
-                return Err(FlatChainstoreError::OversizedIndex);
+                return Err(ChainstoreError::Internal(
+                    format!("index value {index} exceeds 31-bit limit").into(),
+                ));
             }
 
             Ok(Index(index))
         }
 
         /// Create a new fork entry (MSB is set)
-        pub fn new_fork(index: u32) -> Result<Self, FlatChainstoreError> {
+        pub fn new_fork(index: u32) -> Result<Self, ChainstoreError> {
             if index >= Self::FORK_BIT {
                 // Index value is out of bounds for our 31-bit indexes
-                return Err(FlatChainstoreError::OversizedIndex);
+                return Err(ChainstoreError::Internal(
+                    format!("index value {index} exceeds 31-bit limit").into(),
+                ));
             }
 
             Ok(Index(index | Self::FORK_BIT))
@@ -356,75 +375,76 @@ struct Metadata {
 
 #[derive(Debug)]
 /// Errors that can happen whilst interacting with the [`FlatChainStore`].
-pub enum FlatChainstoreError {
-    /// An I/O error.
-    ///
-    /// See the inner error for more information.
-    Io(io::Error),
-
+pub enum ChainstoreError {
     /// The requested block header was not found in the [`FlatChainStore`].
     HeaderNotFound,
 
-    /// Failed to add a block header to the [`FlatChainStore`] due to a full index.
-    FullIndex,
-
-    /// Attempted to create an index larger than 31 bits.
-    OversizedIndex,
-
-    /// Attempted to open a [`FlatChainStore`] database using an unsupported schema.
-    UnsupportedSchema(u32),
-
-    /// The cache lock is poisoned.
-    PoisonedLock,
-
-    /// Invalid value for the database magic.
-    ///
-    /// Usually indicates that the database is corrupted.
-    BadMagic(u32),
-
-    /// The accumulator is larger than [`MAX_ACCUMULATOR_SIZE`].
+    /// the accumulator data exceeds the maximum allowed size of
+    /// [`MAX_ACCUMULATOR_SIZE`] bytes
     OversizedAccumulator,
 
-    /// The [`FlatChainStore`] has a bad metadata file.
-    InvalidMetadataPointer,
-
-    /// The [`FlatChainStore`] is corrupted.
+    /// the database integrity check failed; data is corrupted
     CorruptedDatabase,
 
-    /// No height present on the validation index.
+    /// the validation index references a block without a known height
     ///
-    /// Usually indicates a fork or invalid chain.
+    /// Usually indicates the block is orphaned or on an invalid chain.
     InvalidValidationIndex,
+
+    /// an internal, non-recoverable error
+    ///
+    /// wraps implementation details such as I/O failures, lock poisoning,
+    /// capacity exhaustion, schema mismatches, and other non-actionable
+    /// conditions
+    Internal(Box<dyn std::error::Error + Send + Sync>),
 }
 
-impl Display for FlatChainstoreError {
+impl Display for ChainstoreError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(e) => write!(f, "FlatChainStore I/O Error: {e:?}"),
-            Self::HeaderNotFound => write!(f, "The requested block header was not found in the FlatChainStore"),
-            Self::FullIndex => write!(f, "Failed to add a block to the FlatChainStore due to a full index"),
-            Self::OversizedIndex => write!(f, "Attempted to create an index larger than 31 bits"),
-            Self::UnsupportedSchema(schema_version) => write!(f, "Attempted to open the FlatChainStore database using an unsupported schema with version={}", schema_version),
-            Self::PoisonedLock => write!(f, "The FlatChainStore's cache lock is poisoned"),
-            Self::BadMagic(magic) => write!(f, "The FlatChainStore has bad magic={}", magic),
-            Self::OversizedAccumulator => write!(f, "The FlatChainStore's accumulator is larger than the maximum value of {}", MAX_ACCUMULATOR_SIZE),
-            Self::InvalidMetadataPointer => write!(f, "The FlatChainStore has invalid metadata"),
-            Self::CorruptedDatabase => write!(f, "The FlatChainStore is corrupted"),
-            Self::InvalidValidationIndex => write!(f, "The FlatChainStore has an invalid validation index"),
+            Self::HeaderNotFound => {
+                write!(f, "the requested block header was not found")
+            }
+            Self::OversizedAccumulator => write!(
+                f,
+                "accumulator exceeds the maximum size of {} bytes",
+                MAX_ACCUMULATOR_SIZE
+            ),
+            Self::CorruptedDatabase => write!(f, "database integrity check failed"),
+            Self::InvalidValidationIndex => {
+                write!(f, "validation index has no known height")
+            }
+            Self::Internal(e) => write!(f, "internal error: {e}"),
         }
     }
 }
 
-impl error::Error for FlatChainstoreError {}
+impl error::Error for ChainstoreError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Internal(e) => Some(e.as_ref()),
+            Self::HeaderNotFound
+            | Self::OversizedAccumulator
+            | Self::CorruptedDatabase
+            | Self::InvalidValidationIndex => None,
+        }
+    }
+}
 
-/// Need this to use [FlatChainstoreError] as a [DatabaseError] in [ChainStore]
-impl DatabaseError for FlatChainstoreError {}
+/// Need this to use [ChainstoreError] as a [DatabaseError] in [ChainStore]
+impl DatabaseError for ChainstoreError {}
 
-impl_error_from!(FlatChainstoreError, std::io::Error, Io);
+impl From<io::Error> for ChainstoreError {
+    fn from(e: io::Error) -> Self {
+        ChainstoreError::Internal(Box::new(e))
+    }
+}
 
-impl From<PoisonError<MutexGuard<'_, CacheType>>> for FlatChainstoreError {
+// NOTe: `PoisonError<MutexGuard<'_>>` cannot be boxed as `'static` due to the
+// borrow lifetime on the guard. The diagnostic message is preserved as a string
+impl From<PoisonError<MutexGuard<'_, CacheType>>> for ChainstoreError {
     fn from(_: PoisonError<MutexGuard<'_, CacheType>>) -> Self {
-        FlatChainstoreError::PoisonedLock
+        ChainstoreError::Internal("cache lock poisoned".into())
     }
 }
 
@@ -456,7 +476,7 @@ impl BlockIndex {
     ///
     /// If we have enough changes that we don't want to lose, we should flush the index map to disk.
     /// This makes sure the indexes are persisted, and we can recover them in case of a crash.
-    fn flush(&self) -> Result<(), FlatChainstoreError> {
+    fn flush(&self) -> Result<(), ChainstoreError> {
         self.index_map.flush()?;
 
         Ok(())
@@ -471,8 +491,8 @@ impl BlockIndex {
         &self,
         hash: BlockHash,
         index: Index,
-        get_header_by_index: impl Fn(Index) -> Result<HashedDiskHeader, FlatChainstoreError>,
-    ) -> Result<bool, FlatChainstoreError> {
+        get_header_by_index: impl Fn(Index) -> Result<HashedDiskHeader, ChainstoreError>,
+    ) -> Result<bool, ChainstoreError> {
         let pos = self.hash_map_find_pos(hash, get_header_by_index)?;
 
         match pos {
@@ -495,8 +515,8 @@ impl BlockIndex {
     unsafe fn get_index_for_hash(
         &self,
         hash: BlockHash,
-        get_header_by_index: impl Fn(Index) -> Result<HashedDiskHeader, FlatChainstoreError>,
-    ) -> Result<Option<(Index, DiskBlockHeader)>, FlatChainstoreError> {
+        get_header_by_index: impl Fn(Index) -> Result<HashedDiskHeader, ChainstoreError>,
+    ) -> Result<Option<(Index, DiskBlockHeader)>, ChainstoreError> {
         match self.hash_map_find_pos(hash, get_header_by_index)? {
             IndexBucket::Empty { .. } => Ok(None),
             IndexBucket::Occupied { ptr, header } => Ok(Some((*ptr, header))),
@@ -513,8 +533,8 @@ impl BlockIndex {
     unsafe fn hash_map_find_pos(
         &self,
         block_hash: BlockHash,
-        get_header_by_index: impl Fn(Index) -> Result<HashedDiskHeader, FlatChainstoreError>,
-    ) -> Result<IndexBucket, FlatChainstoreError> {
+        get_header_by_index: impl Fn(Index) -> Result<HashedDiskHeader, ChainstoreError>,
+    ) -> Result<IndexBucket, ChainstoreError> {
         let mut hash = Self::index_hash_fn(block_hash) as usize;
 
         // Retrieve the base pointer to the start of the memory-mapped index
@@ -531,17 +551,24 @@ impl BlockIndex {
             // If this is the first time we've accessed this pointer, this candidate index is 0
             let candidate_index = *entry_ptr;
 
-            // If the header at `candidate_index` matches `block_hash`, this is the target bucket
-            let file_header = get_header_by_index(candidate_index)?;
-            if file_header.hash == block_hash {
-                return Ok(IndexBucket::Occupied {
-                    ptr: entry_ptr,
-                    header: file_header.header,
-                });
+            // if the header at `candidate_index` matches `block_hash`, this is the target bucket
+            let file_header = match get_header_by_index(candidate_index) {
+                Ok(file_header) => Some(file_header),
+                Err(ChainstoreError::HeaderNotFound) if candidate_index.is_empty() => None,
+                Err(e) => return Err(e),
+            };
+            if let Some(file_header) = file_header {
+                if file_header.hash == block_hash {
+                    return Ok(IndexBucket::Occupied {
+                        ptr: entry_ptr,
+                        header: file_header.header,
+                    });
+                }
             }
 
             // If we find an empty index, this bucket is where the entry would be added
-            // Note: The genesis block doesn't reach this point, as its header hash is matched
+            // for candidate index 0, we only get here when the slot does not match the
+            // searched hash (including the genesis mismatch case)
             if candidate_index.is_empty() {
                 return Ok(IndexBucket::Empty { ptr: entry_ptr });
             }
@@ -551,7 +578,7 @@ impl BlockIndex {
         }
 
         // If we reach here, it means the index is full. We should re-hash the map
-        Err(FlatChainstoreError::FullIndex)
+        Err(ChainstoreError::Internal("block index is full".into()))
     }
 
     /// The (short) hash function we use to compute where in the map a given index should be
@@ -613,11 +640,11 @@ impl FlatChainStore {
     /// Creates a new storage, given a configuration
     ///
     /// If any of the I/O operations fail, this function should return an error
-    fn create_chain_store(config: FlatChainStoreConfig) -> Result<Self, FlatChainstoreError> {
+    fn create_chain_store(config: FlatChainStoreConfig) -> Result<Self, ChainstoreError> {
         let file_mode = config.file_permission.unwrap_or(0o600);
-        let datadir: &Path = config.path.as_ref();
+        let dir = &config.path;
 
-        DirBuilder::new().recursive(true).create(datadir)?;
+        DirBuilder::new().recursive(true).create(dir)?;
 
         let index_size = config
             .block_index_size
@@ -634,11 +661,11 @@ impl FlatChainStore {
             .map(Self::truncate_to_pow2)
             .unwrap_or(Self::truncate_to_pow2(10_000));
 
-        let index_path = datadir.join("blocks_index.bin");
-        let headers_path = datadir.join("headers.bin");
-        let metadata_path = datadir.join("metadata.bin");
-        let fork_headers_path = datadir.join("fork_headers.bin");
-        let accumulator_file_path = datadir.join("accumulators.bin");
+        let index_path = format!("{}/blocks_index.bin", dir.display());
+        let headers_path = format!("{}/headers.bin", dir.display());
+        let metadata_path = format!("{}/metadata.bin", dir.display());
+        let fork_headers_path = format!("{}/fork_headers.bin", dir.display());
+        let accumulator_file_path = format!("{}/accumulators.bin", dir.display());
 
         let index_map_file_size = index_size * size_of::<u32>();
         let index_map = unsafe { Self::init_file(&index_path, index_map_file_size, file_mode)? };
@@ -677,6 +704,11 @@ impl FlatChainStore {
             fork_headers_checksum: FileChecksum(0),
         };
 
+        // this is INVARIANT: 1000 is a non-zero compile-time constant
+        #[allow(
+            clippy::expect_used,
+            reason = "compile-time constant is always non-zero"
+        )]
         let cache_size = config.cache_size.and_then(NonZeroUsize::new).unwrap_or(
             NonZeroUsize::new(1000).expect("Infallible: Hard-coded default is always non-zero"),
         );
@@ -699,9 +731,9 @@ impl FlatChainStore {
     }
 
     /// Opens a new storage. If it already exists, just load. If not, create a new one
-    pub fn new(config: FlatChainStoreConfig) -> Result<Self, FlatChainstoreError> {
-        let datadir = &config.path;
-        let metadata_path = datadir.join("metadata.bin");
+    pub fn new(config: FlatChainStoreConfig) -> Result<Self, ChainstoreError> {
+        let dir = &config.path;
+        let metadata_path = format!("{}/metadata.bin", dir.display());
         let file_mode = config.file_permission.unwrap_or(0o600);
 
         // Maybe migrate our database if it's the old version 0
@@ -724,22 +756,26 @@ impl FlatChainStore {
         let metadata = unsafe {
             metadata
                 .as_ref()
-                .ok_or(FlatChainstoreError::InvalidMetadataPointer)?
+                .ok_or_else(|| ChainstoreError::Internal("metadata pointer is null".into()))?
         };
 
         // check the magic number and version
         if metadata.version > FLAT_CHAINSTORE_VERSION {
-            return Err(FlatChainstoreError::UnsupportedSchema(metadata.version));
+            return Err(ChainstoreError::Internal(
+                format!("unsupported schema version: {}", metadata.version).into(),
+            ));
         }
 
         if metadata.magic != FLAT_CHAINSTORE_MAGIC {
-            return Err(FlatChainstoreError::BadMagic(metadata.magic));
+            return Err(ChainstoreError::Internal(
+                format!("bad database magic: {:#010x}", metadata.magic).into(),
+            ));
         }
 
-        let index_path = datadir.join("blocks_index.bin");
-        let headers_file_path = datadir.join("headers.bin");
-        let fork_file_path = datadir.join("fork_headers.bin");
-        let accumulator_file_path = datadir.join("accumulators.bin");
+        let index_path = format!("{}/blocks_index.bin", config.path.display());
+        let headers_file_path = format!("{}/headers.bin", config.path.display());
+        let fork_file_path = format!("{}/fork_headers.bin", config.path.display());
+        let accumulator_file_path = format!("{}/accumulators.bin", config.path.display());
 
         let index_file_size = metadata.index_capacity * size_of::<u32>();
         let headers_file_size = metadata.headers_file_size * size_of::<HashedDiskHeader>();
@@ -748,6 +784,11 @@ impl FlatChainStore {
         let index_map = unsafe { Self::init_file(&index_path, index_file_size, file_mode)? };
         let headers = unsafe { Self::init_file(&headers_file_path, headers_file_size, file_mode)? };
         let fork_headers = unsafe { Self::init_file(&fork_file_path, fork_file_size, file_mode)? };
+        // this is INVARIANT: 1000 is a non-zero compile-time constant
+        #[allow(
+            clippy::expect_used,
+            reason = "compile-time constant is always non-zero"
+        )]
         let cache_size = config.cache_size.and_then(NonZeroUsize::new).unwrap_or(
             NonZeroUsize::new(1000).expect("Infallible: Hard-coded default is always non-zero"),
         );
@@ -777,12 +818,18 @@ impl FlatChainStore {
         &mut self,
         hash: BlockHash,
         index: Index,
-    ) -> Result<(), FlatChainstoreError> {
+    ) -> Result<(), ChainstoreError> {
         let metadata = self.get_metadata()?;
         let next_occupancy = metadata.block_index_occupancy + 1;
 
         if next_occupancy >= metadata.index_capacity {
-            return Err(FlatChainstoreError::FullIndex);
+            return Err(ChainstoreError::Internal(
+                format!(
+                    "block index is full (capacity: {})",
+                    metadata.index_capacity
+                )
+                .into(),
+            ));
         }
 
         let is_new = self
@@ -808,12 +855,12 @@ impl FlatChainStore {
     /// enough for random errors in a file.
     ///
     /// [xxHash]: https://github.com/Cyan4973/xxHash
-    fn check_integrity(&self) -> Result<(), FlatChainstoreError> {
+    fn check_integrity(&self) -> Result<(), ChainstoreError> {
         let computed_checksum = self.compute_checksum();
         let metadata = unsafe { self.get_metadata()? };
 
         if metadata.checksum != computed_checksum {
-            return Err(FlatChainstoreError::CorruptedDatabase);
+            return Err(ChainstoreError::CorruptedDatabase);
         }
 
         Ok(())
@@ -859,11 +906,7 @@ impl FlatChainStore {
 
     /// Initializes a memory-mapped file with the specified byte size and permissions (mode).
     /// If the underlying file does not exist, it will be created.
-    unsafe fn init_file(
-        path: impl AsRef<Path>,
-        size: usize,
-        _mode: u32,
-    ) -> Result<MmapMut, FlatChainstoreError> {
+    unsafe fn init_file(path: &str, size: usize, _mode: u32) -> Result<MmapMut, ChainstoreError> {
         let file = OpenOptions::new()
             // Set read and write access
             .read(true)
@@ -886,10 +929,7 @@ impl FlatChainStore {
     }
 
     /// Returns a reference to the respective disk header from the file. Errors if nothing is found.
-    unsafe fn get_disk_header(
-        &self,
-        index: Index,
-    ) -> Result<&HashedDiskHeader, FlatChainstoreError> {
+    unsafe fn get_disk_header(&self, index: Index) -> Result<&HashedDiskHeader, ChainstoreError> {
         let metadata = self.get_metadata()?;
         let (max_size, base_ptr) = match index.is_main_chain() {
             true => (metadata.headers_file_size, self.headers.as_ptr()),
@@ -898,7 +938,9 @@ impl FlatChainStore {
 
         let index = index.index() as usize;
         if index >= max_size {
-            return Err(FlatChainstoreError::FullIndex);
+            return Err(ChainstoreError::Internal(
+                format!("index {index} exceeds file capacity {max_size}").into(),
+            ));
         }
 
         // SAFETY: we've checked index < max_size
@@ -907,7 +949,7 @@ impl FlatChainStore {
 
         // Uninitialized memory means we haven't written anything here yet
         if header.hash == BlockHash::all_zeros() {
-            return Err(FlatChainstoreError::HeaderNotFound);
+            return Err(ChainstoreError::HeaderNotFound);
         }
 
         Ok(header)
@@ -918,7 +960,7 @@ impl FlatChainStore {
     unsafe fn get_disk_header_mut(
         &mut self,
         index: Index,
-    ) -> Result<&mut HashedDiskHeader, FlatChainstoreError> {
+    ) -> Result<&mut HashedDiskHeader, ChainstoreError> {
         let metadata = self.get_metadata()?;
         let (max_size, base_ptr) = match index.is_main_chain() {
             true => (metadata.headers_file_size, self.headers.as_ptr()),
@@ -927,7 +969,9 @@ impl FlatChainStore {
 
         let index = index.index() as usize;
         if index >= max_size {
-            return Err(FlatChainstoreError::FullIndex);
+            return Err(ChainstoreError::Internal(
+                format!("index {index} exceeds file capacity {max_size}").into(),
+            ));
         }
 
         // SAFETY: we've checked index < max_size
@@ -936,14 +980,22 @@ impl FlatChainStore {
         Ok(&mut *ptr)
     }
 
-    unsafe fn do_save_height(&mut self, best_block: &BestChain) -> Result<(), FlatChainstoreError> {
+    unsafe fn do_save_height(&mut self, best_block: &BestChain) -> Result<(), ChainstoreError> {
         let metadata = self.get_metadata_mut()?;
 
         metadata.best_block = best_block.best_block;
         metadata.depth = best_block.depth;
         metadata.validation_index = best_block.validation_index;
 
-        assert!(best_block.alternative_tips.len() <= 64);
+        if best_block.alternative_tips.len() > 64 {
+            return Err(ChainstoreError::Internal(
+                format!(
+                    "too many alternative tips: {} (max 64)",
+                    best_block.alternative_tips.len()
+                )
+                .into(),
+            ));
+        }
 
         metadata
             .alternative_tips
@@ -956,7 +1008,7 @@ impl FlatChainStore {
         Ok(())
     }
 
-    unsafe fn get_best_chain(&self) -> Result<BestChain, FlatChainstoreError> {
+    unsafe fn get_best_chain(&self) -> Result<BestChain, ChainstoreError> {
         let metadata = self.get_metadata()?;
 
         Ok(BestChain {
@@ -977,7 +1029,7 @@ impl FlatChainStore {
     unsafe fn get_header_by_hash(
         &self,
         hash: BlockHash,
-    ) -> Result<Option<DiskBlockHeader>, FlatChainstoreError> {
+    ) -> Result<Option<DiskBlockHeader>, ChainstoreError> {
         let result = self
             .block_index
             .get_index_for_hash(hash, |height| self.get_disk_header(height).copied())?
@@ -986,17 +1038,29 @@ impl FlatChainStore {
         Ok(result)
     }
 
-    unsafe fn get_metadata(&self) -> Result<&Metadata, FlatChainstoreError> {
+    unsafe fn get_metadata(&self) -> Result<&Metadata, ChainstoreError> {
         let ptr = self.metadata.as_ptr() as *const Metadata;
 
+        // this is INVARIANT: `self.metadata` is a valid `MmapMut` created during construction;
+        // `MmapMut::as_ptr()` always returns a non-null pointer for a valid mapping
+        #[allow(
+            clippy::expect_used,
+            reason = "MmapMut::as_ptr() is non-null for valid mappings"
+        )]
         Ok(ptr
             .as_ref()
             .expect("Infallible: we already validated this pointer"))
     }
 
-    unsafe fn get_metadata_mut(&mut self) -> Result<&mut Metadata, FlatChainstoreError> {
+    unsafe fn get_metadata_mut(&mut self) -> Result<&mut Metadata, ChainstoreError> {
         let ptr = self.metadata.as_ptr() as *mut Metadata;
 
+        // this is INVARIANT: `self.metadata` is a valid `MmapMut` created during construction;
+        // `MmapMut::as_ptr()` always returns a non-null pointer for a valid mapping
+        #[allow(
+            clippy::expect_used,
+            reason = "MmapMut::as_ptr() is non-null for valid mappings"
+        )]
         Ok(ptr
             .as_mut()
             .expect("Infallible: we already validated this pointer"))
@@ -1009,10 +1073,10 @@ impl FlatChainStore {
     unsafe fn write_header_to_storage(
         &mut self,
         header: DiskBlockHeader,
-    ) -> Result<(), FlatChainstoreError> {
+    ) -> Result<(), ChainstoreError> {
         let height = header
             .try_height()
-            .expect("Infallible: this function is only called for best chain blocks");
+            .map_err(|e| ChainstoreError::Internal(Box::new(e)))?;
         let index = Index::new(height)?;
 
         let pos = self.get_disk_header_mut(index)?;
@@ -1064,10 +1128,7 @@ impl FlatChainStore {
     /// We will write 3 in a new position, and it should work fine. However, we now have a stale 3
     /// that points to the main chain position where it originally was. This will never be used
     /// again, but will occupy a position in the index. Increasing the load factor for no reason.
-    unsafe fn save_fork_block(
-        &mut self,
-        header: DiskBlockHeader,
-    ) -> Result<(), FlatChainstoreError> {
+    unsafe fn save_fork_block(&mut self, header: DiskBlockHeader) -> Result<(), ChainstoreError> {
         let fork_blocks = self.get_metadata()?.fork_count;
         let index = Index::new_fork(fork_blocks)?;
 
@@ -1090,7 +1151,7 @@ impl FlatChainStore {
         Ok(())
     }
 
-    unsafe fn do_flush(&mut self) -> Result<(), FlatChainstoreError> {
+    unsafe fn do_flush(&mut self) -> Result<(), ChainstoreError> {
         self.headers.flush()?;
         self.block_index.flush()?;
         self.fork_headers.flush()?;
@@ -1113,7 +1174,7 @@ impl FlatChainStore {
 }
 
 impl ChainStore for FlatChainStore {
-    type Error = FlatChainstoreError;
+    type Error = ChainstoreError;
 
     fn check_integrity(&self) -> Result<(), Self::Error> {
         self.check_integrity()
@@ -1131,7 +1192,7 @@ impl ChainStore for FlatChainStore {
             .get_header(&metadata.validation_index)?
             .map(|h| {
                 h.try_height()
-                    .map_err(|_| FlatChainstoreError::InvalidValidationIndex)
+                    .map_err(|_try_height_err| ChainstoreError::InvalidValidationIndex)
             })
             .transpose()?
             .unwrap_or(0);
@@ -1143,22 +1204,20 @@ impl ChainStore for FlatChainStore {
             // this is where the new acc starts, truncating the file to this position
             let pos = header.acc_pos as u64;
 
-            self.accumulator_file
-                .set_len(pos)
-                .map_err(FlatChainstoreError::Io)?;
+            self.accumulator_file.set_len(pos)?;
         }
 
         let pos = self.accumulator_file.seek(SeekFrom::End(0))?;
         let size = roots.len();
 
         if size > MAX_ACCUMULATOR_SIZE {
-            return Err(FlatChainstoreError::OversizedAccumulator);
+            return Err(ChainstoreError::OversizedAccumulator);
         }
 
         let header = unsafe { self.get_disk_header_mut(index)? };
         // Only write to this header if we actually have it in our store
         if header.hash == BlockHash::all_zeros() {
-            return Err(FlatChainstoreError::HeaderNotFound);
+            return Err(ChainstoreError::HeaderNotFound);
         }
 
         header.acc_pos = pos as u32;
@@ -1213,7 +1272,7 @@ impl ChainStore for FlatChainStore {
         unsafe {
             match self.get_disk_header(index) {
                 Ok(header) => Ok(Some(header.header)),
-                Err(FlatChainstoreError::HeaderNotFound) => Ok(None),
+                Err(ChainstoreError::HeaderNotFound) => Ok(None),
                 Err(e) => Err(e),
             }
         }
@@ -1252,7 +1311,7 @@ impl ChainStore for FlatChainStore {
         unsafe {
             match self.get_disk_header(index) {
                 Ok(header) => Ok(Some(header.hash)),
-                Err(FlatChainstoreError::HeaderNotFound) => Ok(None),
+                Err(ChainstoreError::HeaderNotFound) => Ok(None),
                 Err(e) => Err(e),
             }
         }
@@ -1317,13 +1376,8 @@ pub mod migrate_v0_to_v1 {
     /// If `metadata.bin` is exactly the old size, rename to `.bin.old`, mmap it as `MetadataV0`,
     /// then create a fresh v1 file and copy all fields except the deprecated u32. Returns a bool
     /// indicating whether a migration was performed or not.
-    pub fn maybe_migrate(
-        metadata_path: impl AsRef<Path>,
-        mode: u32,
-    ) -> Result<bool, FlatChainstoreError> {
-        let metadata_path = metadata_path.as_ref();
-
-        match fs::metadata(metadata_path) {
+    pub fn maybe_migrate(path: &str, mode: u32) -> Result<bool, ChainstoreError> {
+        match fs::metadata(path) {
             // No db found, nothing to migrate from
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             // Propagate the rest of errors
@@ -1334,16 +1388,15 @@ pub mod migrate_v0_to_v1 {
         }
 
         // 1) back up
-        let metadata_backup_path = Path::new(metadata_path).with_extension("bin.old");
-        fs::rename(metadata_path, &metadata_backup_path)?;
+        let backup = Path::new(path).with_extension("bin.old");
+        fs::rename(path, &backup)?;
 
         // 2) read old struct
-        let mmap = init_mmap(&metadata_backup_path, size_of::<MetadataV0>())?;
+        let mmap = init_mmap(&backup, size_of::<MetadataV0>())?;
         let old_meta = unsafe { &*(mmap.as_ptr() as *const MetadataV0) };
 
         // 3) create new v1 mmap
-        let mut new_mmap =
-            unsafe { FlatChainStore::init_file(metadata_path, size_of::<Metadata>(), mode)? };
+        let mut new_mmap = unsafe { FlatChainStore::init_file(path, size_of::<Metadata>(), mode)? };
         let new_meta = unsafe { &mut *(new_mmap.as_mut_ptr() as *mut Metadata) };
 
         // 4) copy everything but the deprecated u32, bump version
@@ -1354,7 +1407,7 @@ pub mod migrate_v0_to_v1 {
     }
 
     /// Initialize a read-only mmap
-    pub(super) fn init_mmap(file_path: &Path, size: usize) -> Result<Mmap, FlatChainstoreError> {
+    pub(super) fn init_mmap(file_path: &Path, size: usize) -> Result<Mmap, ChainstoreError> {
         let file = OpenOptions::new().read(true).open(file_path)?;
         let mmap = unsafe { MmapOptions::new().len(size).map(&file)? };
         Ok(mmap)
@@ -1362,6 +1415,7 @@ pub mod migrate_v0_to_v1 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use core::mem::size_of;
     use std::fs;
@@ -1378,12 +1432,13 @@ mod tests {
     use tempfile::TempDir;
     use twox_hash::XxHash3_64;
 
+    use super::ChainstoreError;
     use super::FlatChainStore;
     use super::FlatChainStoreConfig;
-    use super::FlatChainstoreError;
     use super::Index;
     use super::FLAT_CHAINSTORE_MAGIC;
     use super::FLAT_CHAINSTORE_VERSION;
+    use super::MAX_ACCUMULATOR_SIZE;
     use crate::migrate_v0_to_v1::init_mmap;
     use crate::migrate_v0_to_v1::maybe_migrate;
     use crate::pruned_utreexo::flat_chain_store::FileChecksum;
@@ -1425,7 +1480,7 @@ mod tests {
         );
     }
 
-    fn get_test_chainstore(id: Option<u64>) -> Result<FlatChainStore, FlatChainstoreError> {
+    fn get_test_chainstore(id: Option<u64>) -> Result<FlatChainStore, ChainstoreError> {
         let test_id = id.unwrap_or_else(rand::random::<u64>);
 
         let config = FlatChainStoreConfig {
@@ -1474,9 +1529,9 @@ mod tests {
             let store_id = tweak_version_and_magic(version, FLAT_CHAINSTORE_MAGIC);
 
             match get_test_chainstore(Some(store_id)) {
-                Err(FlatChainstoreError::UnsupportedSchema(v)) if v == version => {},
-                Err(e) => panic!("Should have failed with `FlatChainstoreError::DbTooNew({version})`, instead we got {e:?}"),
-                Ok(_) => panic!("Should have failed with `FlatChainstoreError::DbTooNew({version})`, instead we got `Ok`"),
+                Err(ChainstoreError::Internal(_)) => {},
+                Err(e) => panic!("Should have failed with `ChainstoreError::Internal(...)`, instead we got {e:?}"),
+                Ok(_) => panic!("Should have failed with `ChainstoreError::Internal(...)`, instead we got `Ok`"),
             }
         }
 
@@ -1488,9 +1543,9 @@ mod tests {
             let store_id = tweak_version_and_magic(FLAT_CHAINSTORE_VERSION, magic);
 
             match get_test_chainstore(Some(store_id)) {
-                Err(FlatChainstoreError::BadMagic(m)) if m == magic => {},
-                Err(e) => panic!("Should have failed with `FlatChainstoreError::InvalidMagic({magic})`, instead we got {e:?}"),
-                Ok(_) => panic!("Should have failed with `FlatChainstoreError::InvalidMagic({magic})`, instead we got `Ok`"),
+                Err(ChainstoreError::Internal(_)) => {},
+                Err(e) => panic!("Should have failed with `ChainstoreError::Internal(...)`, instead we got {e:?}"),
+                Ok(_) => panic!("Should have failed with `ChainstoreError::Internal(...)`, instead we got `Ok`"),
             }
         }
     }
@@ -1631,19 +1686,19 @@ mod tests {
         // Test that the inner header-fetching function returns the proper error for mainnet indices
         unsafe {
             match store.get_disk_header(Index::new(151).unwrap()) {
-                Err(FlatChainstoreError::HeaderNotFound) => (),
+                Err(ChainstoreError::HeaderNotFound) => (),
                 Err(e) => panic!("Unexpected err: {e:?}"),
                 Ok(val) => panic!("Should not have found a header at height 151: {val:?}"),
             }
             // Last available position
             match store.get_disk_header(Index::new(32_767).unwrap()) {
-                Err(FlatChainstoreError::HeaderNotFound) => (),
+                Err(ChainstoreError::HeaderNotFound) => (),
                 Err(e) => panic!("Unexpected err: {e:?}"),
                 Ok(val) => panic!("Should not have found a header at height 32767: {val:?}"),
             }
             // Exceeds header file capacity
             match store.get_disk_header(Index::new(32_768).unwrap()) {
-                Err(FlatChainstoreError::FullIndex) => (),
+                Err(ChainstoreError::Internal(_)) => (),
                 Err(e) => panic!("Unexpected err: {e:?}"),
                 Ok(val) => {
                     panic!("Should not have found a header exceeding file capacity: {val:?}")
@@ -1654,19 +1709,19 @@ mod tests {
         // Test that the inner header-fetching function returns the proper error for fork indices
         unsafe {
             match store.get_disk_header(Index::new_fork(0).unwrap()) {
-                Err(FlatChainstoreError::HeaderNotFound) => (),
+                Err(ChainstoreError::HeaderNotFound) => (),
                 Err(e) => panic!("Unexpected err: {e:?}"),
                 Ok(val) => panic!("Should not have found any fork header: {val:?}"),
             }
             // Last available position
             match store.get_disk_header(Index::new_fork(16_383).unwrap()) {
-                Err(FlatChainstoreError::HeaderNotFound) => (),
+                Err(ChainstoreError::HeaderNotFound) => (),
                 Err(e) => panic!("Unexpected err: {e:?}"),
                 Ok(val) => panic!("Should not have found any fork header: {val:?}"),
             }
             // Exceeds fork file capacity
             match store.get_disk_header(Index::new_fork(16_384).unwrap()) {
-                Err(FlatChainstoreError::FullIndex) => (),
+                Err(ChainstoreError::Internal(_)) => (),
                 Err(e) => panic!("Unexpected err: {e:?}"),
                 Ok(val) => {
                     panic!("Should not have found a header exceeding file capacity: {val:?}")
@@ -1830,9 +1885,149 @@ mod tests {
         let result = store.save_roots_for_block(acc.clone(), 10);
 
         match result {
-            Err(FlatChainstoreError::HeaderNotFound) => (),
+            Err(ChainstoreError::HeaderNotFound) => (),
             Err(e) => panic!("Unexpected err: {e:?}"),
             Ok(_) => panic!("Should not have been able to save roots for a block we don't have"),
         }
+    }
+
+    #[test]
+    fn propagates_header_not_found() {
+        let store = get_test_chainstore(None).unwrap();
+        let missing = BlockHash::from_byte_array([0xAB; 32]);
+        let err = store.get_header(&missing).unwrap();
+        // get_header returns Ok(None) for missing headers
+        assert!(err.is_none());
+
+        // get_header_by_height returns Ok(None) for unwritten heights
+        let err = store.get_header_by_height(9999).unwrap();
+        assert!(err.is_none());
+
+        // get_disk_header returns HeaderNotFound for unwritten-but-in-range indices
+        let result = unsafe { store.get_disk_header(Index::new(1).unwrap()) };
+        let err = result.unwrap_err();
+        assert!(matches!(err, ChainstoreError::HeaderNotFound));
+    }
+
+    #[test]
+    fn propagates_oversized_accumulator() {
+        let mut store = get_test_chainstore(None).unwrap();
+
+        // try to save the genesis block so we have a header at height 0
+        let genesis = genesis_block(Network::Regtest);
+        store
+            .save_header(&DiskBlockHeader::FullyValid(genesis.header, 0))
+            .unwrap();
+        store.update_block_index(0, genesis.block_hash()).unwrap();
+        store
+            .save_height(&BestChain {
+                best_block: genesis.block_hash(),
+                depth: 0,
+                validation_index: genesis.block_hash(),
+                alternative_tips: vec![],
+            })
+            .unwrap();
+
+        // try to save an accumulator that exceeds the maximum size
+        let oversized = vec![0u8; MAX_ACCUMULATOR_SIZE + 1];
+        let err = store.save_roots_for_block(oversized, 0).unwrap_err();
+        assert!(matches!(err, ChainstoreError::OversizedAccumulator));
+    }
+
+    #[test]
+    fn propagates_corrupted_database() {
+        let test_id = rand::random::<u64>();
+        let mut store = get_test_chainstore(Some(test_id)).unwrap();
+        store.flush().unwrap();
+
+        // corrupt the database by tampering with the checksum
+        let metadata = unsafe { store.get_metadata_mut().unwrap() };
+        metadata.checksum.headers_checksum = FileChecksum(0xDEAD_BEEF);
+
+        let err = store.check_integrity().unwrap_err();
+        assert!(matches!(err, ChainstoreError::CorruptedDatabase));
+    }
+
+    #[test]
+    fn propagates_internal_from_io() {
+        use core::error::Error;
+
+        let err = ChainstoreError::from(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "test io error",
+        ));
+        assert!(matches!(err, ChainstoreError::Internal(_)));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn propagates_internal_from_bad_magic() {
+        let test_id = rand::random::<u64>();
+        let mut store = get_test_chainstore(Some(test_id)).unwrap();
+
+        let metadata = unsafe { store.get_metadata_mut().unwrap() };
+        metadata.magic = 0xBAD0_FACE;
+        store.flush().unwrap();
+
+        let err = match get_test_chainstore(Some(test_id)) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(matches!(err, ChainstoreError::Internal(_)));
+    }
+
+    #[test]
+    fn propagates_internal_from_unsupported_schema() {
+        let test_id = rand::random::<u64>();
+        let mut store = get_test_chainstore(Some(test_id)).unwrap();
+
+        let metadata = unsafe { store.get_metadata_mut().unwrap() };
+        metadata.version = FLAT_CHAINSTORE_VERSION + 99;
+        store.flush().unwrap();
+
+        let err = match get_test_chainstore(Some(test_id)) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(matches!(err, ChainstoreError::Internal(_)));
+    }
+
+    #[test]
+    fn propagates_internal_from_oversized_index() {
+        // index values >= 0x8000_0000 are out of bounds for 31-bit indexes
+        let err = Index::new(0x8000_0000).unwrap_err();
+        assert!(matches!(err, ChainstoreError::Internal(_)));
+    }
+
+    #[test]
+    fn propagates_internal_from_capacity_exceeded() {
+        let store = get_test_chainstore(None).unwrap();
+
+        // try to access an index beyond the header file capacity (32_768)
+        let result = unsafe { store.get_disk_header(Index::new(32_768).unwrap()) };
+        let err = result.unwrap_err();
+        assert!(matches!(err, ChainstoreError::Internal(_)));
+    }
+
+    #[test]
+    fn propagates_invalid_validation_index() {
+        let mut store = get_test_chainstore(None).unwrap();
+        let genesis = genesis_block(Network::Regtest);
+
+        // save an orphan header, then point validation_index to it, orphan headers
+        // don't have a stored height, so save_roots_for_block must surface
+        // InvalidValidationIndex instead of HeaderNotFound
+        let mut orphan_header = genesis.header;
+        orphan_header.nonce = orphan_header.nonce.wrapping_add(1);
+        let orphan_hash = orphan_header.block_hash();
+        store
+            .save_header(&DiskBlockHeader::Orphan(orphan_header))
+            .unwrap();
+
+        let metadata = unsafe { store.get_metadata_mut().unwrap() };
+        metadata.validation_index = orphan_hash;
+
+        let err = store.save_roots_for_block(vec![0u8], 0).unwrap_err();
+        assert!(matches!(err, ChainstoreError::InvalidValidationIndex));
     }
 }
