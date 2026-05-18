@@ -197,11 +197,11 @@ pub struct FlatChainStoreConfig {
 
 impl FlatChainStoreConfig {
     /// Creates a new configuration with the default values
-    pub fn new(path: String) -> Self {
+    pub fn new(path: impl Into<String>) -> Self {
         FlatChainStoreConfig {
             file_permission: Some(0o666),
             fork_file_size: Some(10_000),
-            path,
+            path: path.into(),
             headers_file_size: Some(10_000_000),
             block_index_size: Some(10_000_000),
             cache_size: Some(10_000),
@@ -1619,7 +1619,7 @@ mod tests {
     #[test]
     fn test_save_and_retrieve_headers() {
         let mut store = get_test_chainstore(None).unwrap();
-        let blocks = include_str!("../../testdata/blocks.txt");
+        let blocks = include_str!("../../testdata/regtest_blocks.txt");
 
         for (i, line) in blocks.lines().enumerate() {
             let block = hex::decode(line).unwrap();
@@ -1749,7 +1749,7 @@ mod tests {
     fn test_index() {
         let mut store = get_test_chainstore(None).unwrap();
         let mut hashes = Vec::new();
-        let blocks = include_str!("../../testdata/blocks.txt");
+        let blocks = include_str!("../../testdata/regtest_blocks.txt");
 
         for (i, line) in blocks.lines().enumerate() {
             let block = hex::decode(line).unwrap();
@@ -1806,7 +1806,7 @@ mod tests {
     #[test]
     fn test_fork_blocks() {
         let mut store = get_test_chainstore(None).unwrap();
-        let file = include_str!("../../testdata/blocks.txt");
+        let file = include_str!("../../testdata/regtest_blocks.txt");
         let headers = file
             .lines()
             .map(|x| hex::decode(x).unwrap())
