@@ -1191,7 +1191,7 @@ impl ChainStore for FlatChainStore {
             .get_header(&metadata.validation_index)?
             .map(|h| {
                 h.try_height()
-                    .map_err(|_| ChainstoreError::InvalidValidationIndex)
+                    .map_err(|_try_height_err| ChainstoreError::InvalidValidationIndex)
             })
             .transpose()?
             .unwrap_or(0);
