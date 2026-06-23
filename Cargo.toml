@@ -85,8 +85,37 @@ floresta-mempool = { path = "crates/floresta-mempool" }
 metrics = { path = "metrics" }
 
 [workspace.lints.clippy]
+# ── Existing lints (already enforced) ────────────────────────────────
 unused_async = "deny"
 use_self = "deny"
+
+# ── Error-handling overhaul lints (issue #1053) ──────────────────────
+# Classification: "deny" = zero violations workspace-wide today;
+#                 "warn" = violations remain — surfaces backlog in CI
+#                          without breaking the build.
+# Ratchet path: promote warn → deny per-crate as module refactor PRs land.
+
+# Core targets — unwrap / expect / panic family
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unreachable = "warn"
+todo = "deny"
+unimplemented = "warn"
+
+# Defensive indexing & arithmetic
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+
+# Error-type quality
+map_err_ignore = "warn"
+wildcard_enum_match_arm = "warn"
+result_unit_err = "deny"
+
+# Documentation & payload hygiene (always warn per tracking issue)
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+result_large_err = "warn"
 
 [profile.release]
 opt-level = 3     # maximum optimization level
