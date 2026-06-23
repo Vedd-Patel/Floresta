@@ -6,48 +6,21 @@ gettxout.py
 This functional test cli utility to interact with a Floresta node with `gettxout` command.
 """
 
-import time
 import pytest
-
-TIMEOUT_SECONDS = 120
 
 
 # pylint: disable=too-many-locals
 @pytest.mark.rpc
-def test_get_txout(setup_logging, florestad_bitcoind_utreexod_with_chain):
+def test_get_txout(setup_logging, florestad_bitcoind_utreexod_with_chain, node_manager):
     """
     Test the `gettxout` command for a specific transaction output.
     """
     log = setup_logging
     blocks = 10
-    florestad, bitcoind, utreexod = florestad_bitcoind_utreexod_with_chain(blocks)
-
-    peer_info = bitcoind.rpc.get_peerinfo()
-    peer_id = next(peer["id"] for peer in peer_info if "utreexo" in peer["subver"])
-    best_block_hash = utreexod.rpc.get_blockhash(blocks)
+    florestad, bitcoind, _ = florestad_bitcoind_utreexod_with_chain(blocks)
 
     log.info("Waiting for Floresta and Bitcoind to sync with Utreexod...")
-    timeout = time.time() + TIMEOUT_SECONDS
-    while time.time() < timeout:
-        floresta_info = florestad.rpc.get_blockchain_info()
-        if (
-            floresta_info["height"]
-            == utreexod.rpc.get_block_count()
-            == bitcoind.rpc.get_block_count()
-            == blocks
-            and not floresta_info["ibd"]
-        ):
-            break
-
-        time.sleep(1)
-        # Forcing a re-fetch of the block from the peer
-        try:
-            bitcoind.rpc.get_block_from_peer(best_block_hash, peer_id)
-        # pylint: disable=broad-exception-caught
-        except Exception as e:
-            log.error(f"Error fetching block from peer: {e}")
-
-    assert floresta_info["height"] == blocks and not floresta_info["ibd"]
+    node_manager.wait_for_sync_nodes()
 
     log.info("Comparing gettxout results between Floresta and Bitcoind...")
     for height in range(2, blocks):

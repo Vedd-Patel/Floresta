@@ -44,6 +44,7 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
+use tracing::warn;
 
 use crate::get_arg;
 use crate::json_rpc_res;
@@ -107,7 +108,15 @@ impl<S: AsyncStream> TcpActor<S> {
                             break;
                         }
                         Err(e) => {
-                            error!("Error reading from client: {e:?}");
+                            if e.kind() == std::io::ErrorKind::InvalidData {
+                                warn!(
+                                    "Error reading from client: {e:?}. Perhaps you are sending \
+                                     TLS traffic on a cleartext stream? Disable TLS in your \
+                                     wallet, or connect to the SSL Electrum port instead."
+                                );
+                            } else {
+                                warn!("Error reading from client: {e:?}");
+                            }
                             self.message_transmitter
                                 .send(Message::Disconnect(self.client_id))
                                 .expect("Main loop is broken");

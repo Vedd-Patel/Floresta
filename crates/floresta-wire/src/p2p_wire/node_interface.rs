@@ -23,7 +23,7 @@ use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::message_filter::CFHeaders;
-use floresta_mempool::mempool::MempoolError;
+use floresta_domain::mempool::MempoolError;
 use serde::Serialize;
 
 use super::UtreexoNodeConfig;

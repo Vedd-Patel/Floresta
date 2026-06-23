@@ -42,7 +42,7 @@ pub mod jsonrpc_interface {
     use floresta_chain::BlockchainError;
     use floresta_chain::extensions::HeaderExtError;
     use floresta_common::impl_error_from;
-    use floresta_mempool::mempool::MempoolError;
+    use floresta_domain::mempool::MempoolError;
     use floresta_watch_only::WatchOnlyError;
     use floresta_wire::bitcoin_socket_addr::InvalidAddressError;
     use serde::Deserialize;
@@ -507,21 +507,6 @@ pub mod jsonrpc_interface {
             }
         }
     }
-}
-#[derive(Deserialize, Serialize)]
-pub struct GetBlockchainInfoRes {
-    pub best_block: String,
-    pub height: u32,
-    pub ibd: bool,
-    pub validated: u32,
-    pub latest_work: String,
-    pub latest_block_time: u32,
-    pub leaf_count: u32,
-    pub root_count: u32,
-    pub root_hashes: Vec<String>,
-    pub chain: String,
-    pub progress: f32,
-    pub difficulty: u64,
 }
 
 /// A confidence enum to auxiliate rescan timestamp values.

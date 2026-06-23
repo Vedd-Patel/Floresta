@@ -21,7 +21,7 @@ use bitcoin::BlockHash;
 use bitcoin::Transaction;
 use bitcoin::Txid;
 use bitcoin::p2p::message_filter::CFHeaders;
-use floresta_mempool::mempool::MempoolError;
+use floresta_domain::mempool::MempoolError;
 use rustreexo::proof::Proof;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;

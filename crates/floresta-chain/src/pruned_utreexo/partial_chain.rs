@@ -39,6 +39,7 @@ use super::chainparams::ChainParams;
 use super::consensus::Consensus;
 use super::error::BlockValidationErrors;
 use super::error::BlockchainError;
+use crate::pruned_utreexo::IBDState;
 use crate::pruned_utreexo::utxo_data::UtxoData;
 
 #[doc(hidden)]
@@ -284,8 +285,9 @@ impl UpdatableChainstate for PartialChainState {
         Ok(())
     }
 
-    fn toggle_ibd(&self, _is_ibd: bool) {
-        // no-op: we know if we finished by looking at our current and end height
+    fn update_ibd(&self, _ibd_state: IBDState) {
+        // no-op: we are only used for IBD, so we are always in IBD, and we don't need to update
+        // anything
     }
 
     // these are unimplemented, and will panic if called
@@ -329,12 +331,20 @@ impl UpdatableChainstate for PartialChainState {
 impl BlockchainInterface for PartialChainState {
     type Error = BlockchainError;
 
+    fn ibd_state(&self) -> IBDState {
+        IBDState::DownloadingBlocks
+    }
+
     fn get_params(&self) -> bitcoin::params::Params {
         self.inner().chain_params().params
     }
 
     fn acc(&self) -> Stump {
         self.inner().current_acc.clone()
+    }
+
+    fn size_on_disk(&self) -> Result<u64, Self::Error> {
+        unimplemented!("partialChainState has no on-disk presence")
     }
 
     fn get_height(&self) -> Result<u32, Self::Error> {

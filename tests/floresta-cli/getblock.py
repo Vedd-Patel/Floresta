@@ -9,10 +9,7 @@ This functional test cli utility to interact with a Floresta node with `getblock
 import time
 import random
 from typing import Any
-
 import pytest
-
-TIMEOUT_SECONDS = 20
 
 
 class TestGetBlock:
@@ -44,14 +41,8 @@ class TestGetBlock:
         self.node_manager.connect_nodes(self.florestad, self.bitcoind)
 
         block_count = self.bitcoind.rpc.get_block_count()
-        end = time.time() + TIMEOUT_SECONDS
-        while time.time() < end:
-            floresta_count = self.florestad.rpc.get_block_count()
-            if floresta_count == block_count:
-                break
-            time.sleep(0.5)
 
-        assert floresta_count == block_count
+        self.node_manager.wait_for_sync_nodes(is_finished_ibd=False)
 
         self.log.info("Testing getblock RPC in the genesis block")
         self.compare_block(0)

@@ -27,7 +27,7 @@ use bitcoin::p2p::message_filter::CFHeaders;
 use bitcoin::p2p::message_filter::GetCFHeaders;
 use bitcoin::p2p::message_network::VersionMessage;
 use floresta_common::impl_error_from;
-use floresta_mempool::Mempool;
+use floresta_domain::mempool::MempoolBase;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::spawn;
@@ -132,7 +132,7 @@ pub fn create_actors<R: AsyncRead + Unpin + Send>(
 }
 
 pub struct Peer<T: AsyncWrite + Unpin + Send + Sync> {
-    mempool: Arc<Mutex<Mempool>>,
+    mempool: Arc<Mutex<dyn MempoolBase>>,
     blocks_only: bool,
     services: ServiceFlags,
     user_agent: String,
@@ -539,7 +539,11 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     self.write(NetworkMessage::Inv(Vec::new())).await?;
                 }
                 NetworkMessage::GetAddr => {
-                    self.write(NetworkMessage::AddrV2(Vec::new())).await?;
+                    if self.wants_addrv2 {
+                        self.write(NetworkMessage::AddrV2(Vec::new())).await?;
+                        return Ok(());
+                    }
+                    self.write(NetworkMessage::Addr(Vec::new())).await?;
                 }
                 NetworkMessage::GetData(inv) => {
                     for inv_el in inv {
@@ -555,8 +559,8 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     }
                 }
                 NetworkMessage::SendAddrV2 => {
-                    self.wants_addrv2 = true;
-                    self.write(NetworkMessage::SendAddrV2).await?;
+                    warn!("Peer {} sent SendAddrV2 after handshake completed", self.id);
+                    return Err(PeerError::UnexpectedMessage);
                 }
                 NetworkMessage::Pong(_) => {
                     self.last_ping = None;
@@ -682,13 +686,13 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
     pub async fn handle_get_data(&mut self, inv: Inventory) -> Result<()> {
         match inv {
             Inventory::WitnessTransaction(txid) => {
-                let tx = self.mempool.lock().await.get_from_mempool(&txid).cloned();
+                let tx = self.mempool.lock().await.get_from_mempool(txid).cloned();
                 if let Some(tx) = tx {
                     self.write(NetworkMessage::Tx(tx)).await?;
                 }
             }
             Inventory::Transaction(txid) => {
-                let tx = self.mempool.lock().await.get_from_mempool(&txid).cloned();
+                let tx = self.mempool.lock().await.get_from_mempool(txid).cloned();
                 if let Some(tx) = tx {
                     self.write(NetworkMessage::Tx(tx)).await?;
                 }
@@ -702,7 +706,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
     pub fn create_peer<W: AsyncWrite + Unpin + Send + Sync + 'static>(
         id: u32,
         address: LocalAddress,
-        mempool: Arc<Mutex<Mempool>>,
+        mempool: Arc<Mutex<dyn MempoolBase>>,
         node_tx: UnboundedSender<NodeNotification>,
         node_requests: UnboundedReceiver<NodeRequest>,
         kind: ConnectionKind,
