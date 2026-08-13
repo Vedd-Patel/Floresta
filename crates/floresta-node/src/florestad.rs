@@ -709,8 +709,7 @@ impl Florestad {
         network: Network,
         assume_valid: AssumeValidArg,
     ) -> Result<ChainState<ChainStore>, FlorestadError> {
-        let chain_store_config =
-            FlatChainStoreConfig::new_with_path(datadir.as_ref().join("chaindata"));
+        let chain_store_config = FlatChainStoreConfig::new_with_path(datadir.as_ref().join("chaindata"));
 
         let chain_store = ChainStore::new(chain_store_config)
             .map_err(|e| FlorestadError::CouldNotLoadFlatChainStore(e.into()))?;
@@ -724,7 +723,8 @@ impl Florestad {
         let database = KvDatabase::new(&self.config.datadir)
             .map_err(FlorestadError::CouldNotOpenKvDatabase)?;
 
-        let wallet = AddressCache::new(database);
+        let wallet =
+            AddressCache::new(database).map_err(FlorestadError::CouldNotInitializeWallet)?;
 
         wallet
             .setup()
@@ -754,7 +754,7 @@ impl Florestad {
         }
 
         for address in self.get_addresses()? {
-            wallet.cache_address(address);
+            let _ = wallet.cache_address(address);
         }
 
         info!("Wallet setup completed!");

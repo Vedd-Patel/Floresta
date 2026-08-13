@@ -54,6 +54,9 @@ pub enum KvDatabaseError {
 
     /// The [`CachedTransaction`] was not found.
     TransactionNotFound,
+
+    /// Invalid txid
+    InvalidTxid,
 }
 
 impl Display for KvDatabaseError {
@@ -66,6 +69,7 @@ impl Display for KvDatabaseError {
             Self::TransactionNotFound => {
                 write!(f, "The requested transaction was not found in the database")
             }
+            Self::InvalidTxid => write!(f, "Invalid txid"),
         }
     }
 }
@@ -101,20 +105,19 @@ impl AddressCacheDatabase for KvDatabase {
     }
 
     /// Save a [`CachedAddress`] to the [`KvDatabase`].
-    fn save(&self, address: &CachedAddress) {
+    fn save(&self, address: &CachedAddress) -> Result<()> {
         let key = address.script_hash.to_string();
-        let value = serde_json::to_vec(&address).expect("Invalid object serialization");
+        let value = serde_json::to_vec(&address).map_err(|e| KvDatabaseError::SerdeJsonError(e))?;
         let bucket = &self.1;
 
-        bucket
-            .set(&key, &value)
-            .expect("Fatal: Database isn't working");
-        bucket.flush().expect("Could not write to disk");
+        bucket.set(&key, &value)?;
+        bucket.flush()?;
+        Ok(())
     }
 
     /// Update a [`CachedAddress`] in the [`KvDatabase`].
-    fn update(&self, address: &CachedAddress) {
-        self.save(address);
+    fn update(&self, address: &CachedAddress) -> Result<()> {
+        self.save(address)
     }
 
     /// Get the height which [`CachedAddress`]es are cached to.
@@ -146,10 +149,7 @@ impl AddressCacheDatabase for KvDatabase {
 
         descriptors.push(String::from(descriptor));
 
-        bucket.set(
-            &String::from("desc"),
-            &serde_json::to_vec(&descriptors).unwrap(),
-        )?;
+        bucket.set(&String::from("desc"), &serde_json::to_vec(&descriptors)?)?;
         bucket.flush()?;
 
         Ok(())
@@ -165,15 +165,14 @@ impl AddressCacheDatabase for KvDatabase {
         Ok(Vec::new())
     }
 
-    /// Get a [`CachedTransaction`] from the [`KvDatabase`], given its [`Txid`].
-    fn get_transaction(&self, txid: &Txid) -> Result<CachedTransaction> {
+    fn get_transaction(&self, txid: &Txid) -> Result<Option<CachedTransaction>> {
         let tx_store = self.0.bucket::<&[u8], Vec<u8>>(Some("transactions"))?;
 
         let transaction = tx_store.get(&txid.as_byte_array().to_vec().as_slice())?;
         if let Some(transaction) = transaction {
-            return Ok(serde_json::de::from_slice(&transaction)?);
+            return Ok(Some(serde_json::de::from_slice(&transaction)?));
         }
-        Err(KvDatabaseError::TransactionNotFound)
+        Ok(None)
     }
 
     /// Save a [`CachedTransaction`] to the [`KvDatabase`].
@@ -199,7 +198,7 @@ impl AddressCacheDatabase for KvDatabase {
         for item in tx_store.iter() {
             let item = item?;
             let key = item.key::<&[u8]>()?;
-            transactions.push(Txid::from_slice(key).unwrap());
+            transactions.push(Txid::from_slice(key).map_err(|_| KvDatabaseError::InvalidTxid)?);
         }
         Ok(transactions)
     }
@@ -302,7 +301,7 @@ mod test {
         assert_eq!(db.get_stats().unwrap().address_count, 11);
 
         db.save_transaction(&cache_tx).unwrap();
-        assert_eq!(db.get_transaction(&cache_tx.hash).unwrap(), cache_tx);
+        assert_eq!(db.get_transaction(&cache_tx.hash).unwrap(), Some(cache_tx.clone()));
         assert_eq!(db.list_transactions().unwrap(), vec![cache_tx.hash]);
 
         db.set_cache_height(test_height).unwrap();
