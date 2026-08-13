@@ -162,7 +162,7 @@ where
     /// If we get an empty headers message, we'll check what to do next, depending on
     /// our current state. We may poke our peers to see if they have an alternative tip,
     /// or we may just finish the IBD, if no one have an alternative tip.
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::expect_used, reason = "INVARIANT: headers is not empty")]
     async fn handle_headers(
         &mut self,
         peer: PeerId,
@@ -193,7 +193,7 @@ where
             }
         }
 
-        let last = headers.last().expect("INVARIANT: headers is not empty").block_hash();
+        let last = headers.last().expect("BUG: headers is not empty").block_hash();
         self.context
             .tip_cache
             .entry(peer)
@@ -549,7 +549,7 @@ where
     /// This method will find what the accumulator looks like for a block with (height, hash).
     /// Check-out [this](https://blog.dlsouza.lol/2023/09/28/pow-fraud-proof.html) post
     /// to learn how the cut-and-choose protocol works
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::expect_used, reason = "INVARIANT: candidate_accs has exactly 1 element")]
     async fn find_accumulator_for_block(
         &mut self,
         height: u32,
@@ -610,7 +610,7 @@ where
         //we should have only one candidate left
         assert_eq!(candidate_accs.len(), 1);
 
-        Self::parse_acc(&candidate_accs.pop().expect("INVARIANT: candidate_accs has exactly 1 element").1)
+        Self::parse_acc(&candidate_accs.pop().expect("BUG: candidate_accs has exactly 1 element").1)
     }
 
     /// If we get an empty `headers` message, our next action depends on which state are
@@ -908,7 +908,7 @@ where
         Ok(LoopControl::Continue)
     }
 
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::expect_used, reason = "INVARIANT: peer_accs has at least 1 element")]
     async fn find_accumulator_for_block_step(
         &mut self,
         block: BlockHash,
@@ -965,7 +965,7 @@ where
 
         if peer_accs.len() == 1 {
             warn!("Only one peers with the UTREEXO_FILTER service flag");
-            return Ok(FindAccResult::Found(peer_accs.pop().expect("INVARIANT: peer_accs has exactly 1 element").1));
+            return Ok(FindAccResult::Found(peer_accs.pop().expect("BUG: peer_accs has exactly 1 element").1));
         }
 
         let mut accs = HashSet::new();
@@ -975,7 +975,7 @@ where
 
         // if all peers have the same state, we can assume it's the correct one
         if accs.len() == 1 {
-            return Ok(FindAccResult::Found(peer_accs.pop().expect("INVARIANT: peer_accs has at least 1 element").1));
+            return Ok(FindAccResult::Found(peer_accs.pop().expect("BUG: peer_accs has at least 1 element").1));
         }
 
         // if we have different states, we need to keep looking until we find the

@@ -75,6 +75,7 @@ struct TcpActor<S: AsyncStream> {
 }
 
 impl<S: AsyncStream> TcpActor<S> {
+    #[allow(clippy::expect_used, reason = "INVARIANT: unbounded channel failure implies reactor died")]
     async fn run(&mut self) {
         let (reader, mut writer) = tokio::io::split(&mut self.stream);
         let mut lines = BufReader::new(reader).lines();
@@ -99,13 +100,13 @@ impl<S: AsyncStream> TcpActor<S> {
                         Ok(Some(line)) => {
                             self.message_transmitter
                                 .send(Message::Message((self.client_id, line)))
-                                .expect("Main loop is broken");
+                                .expect("BUG: Main loop is broken");
                         }
                         Ok(None) => {
                             info!("Client closed connection: {}", self.client_id);
                             self.message_transmitter
                                 .send(Message::Disconnect(self.client_id))
-                                .expect("Main loop is broken");
+                                .expect("BUG: Main loop is broken");
                             break;
                         }
                         Err(e) => {
@@ -120,7 +121,7 @@ impl<S: AsyncStream> TcpActor<S> {
                             }
                             self.message_transmitter
                                 .send(Message::Disconnect(self.client_id))
-                                .expect("Main loop is broken");
+                                .expect("BUG: Main loop is broken");
                             break;
                         }
                     }
@@ -531,7 +532,9 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                     .map(|spend| (tx.clone(), spend))
                     .collect::<Vec<_>>();
 
-                self.wallet_notify(&updated);
+                if let Err(e) = self.wallet_notify(&updated) {
+                    error!("Error notifying wallet: {e}");
+                }
                 json_rpc_res!(request, txid)
             }
             "blockchain.transaction.get" => {
@@ -578,7 +581,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 let genesis_hash = self
                     .chain
                     .get_block_hash(0)
-                    .expect("Genesis block should be present");
+                    .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
                 let res = json!(
                     {
                         "genesis_hash": genesis_hash,
@@ -629,7 +632,9 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
 
         loop {
             for (block, height) in blocks.recv() {
-                self.handle_block(block, height);
+                if let Err(e) = self.handle_block(block, height) {
+                    error!("Error handling block: {e}");
+                }
             }
 
             // handles client requests
@@ -731,11 +736,12 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             let height = self
                 .chain
                 .get_block_height(&block.block_hash())
-                .ok()
-                .flatten()
-                .unwrap();
+                .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?
+                .unwrap_or(0);
 
-            self.handle_block(block, height);
+            if let Err(e) = self.handle_block(block, height) {
+                error!("Error handling block: {e}");
+            }
         }
 
         Ok(())
@@ -762,7 +768,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         res
     }
 
-    fn handle_block(&self, block: bitcoin::Block, height: u32) {
+    fn handle_block(&self, block: bitcoin::Block, height: u32) -> Result<(), crate::error::Error> {
         let result = json!({
             "jsonrpc": "2.0",
             "method": "blockchain.headers.subscribe",
@@ -786,9 +792,9 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             }
         }
 
-        if self.chain.get_height().unwrap() == height {
+        if self.chain.get_height().map_err(|e| super::error::Error::Blockchain(Box::new(e)))? == height {
             for client in &mut self.clients.values() {
-                try_and_log!(client.write(serde_json::to_string(&result).unwrap().as_bytes()));
+                try_and_log!(client.write(serde_json::to_string(&result)?.as_bytes()));
             }
         }
 
@@ -800,7 +806,8 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             }
         };
 
-        self.wallet_notify(&transactions);
+        self.wallet_notify(&transactions)?;
+        Ok(())
     }
 
     /// Handles each kind of Message
@@ -813,17 +820,15 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             Message::Message((client, msg)) => {
                 trace!("Message: {msg}");
                 if let Ok(req) = serde_json::from_str::<Request>(msg.as_str()) {
-                    let client = self.clients.get(&client);
-                    if client.is_none() {
+                    let Some(client) = self.clients.get(&client).cloned() else {
                         error!("Client sent a message but is not listed as client");
                         return Ok(());
-                    }
-                    let client = client.unwrap().to_owned();
+                    };
                     let id = req.id.to_owned();
                     let res = self.handle_client_request(client.clone(), req).await;
 
                     if let Ok(res) = res {
-                        client.write(serde_json::to_string(&res).unwrap().as_bytes())?;
+                        client.write(serde_json::to_string(&res)?.as_bytes())?;
                     } else {
                         let res = json!({
                             "jsonrpc": "2.0",
@@ -834,17 +839,15 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                             },
                             "id": id
                         });
-                        client.write(serde_json::to_string(&res).unwrap().as_bytes())?;
+                        client.write(serde_json::to_string(&res)?.as_bytes())?;
                     }
                 } else if let Ok(requests) = serde_json::from_str::<Vec<Request>>(&msg) {
                     let mut results = Vec::new();
                     for req in requests {
-                        let client = self.clients.get(&client);
-                        if client.is_none() {
+                        let Some(client) = self.clients.get(&client).cloned() else {
                             error!("Client sent a message but is not listed as client");
                             return Ok(());
-                        }
-                        let client = client.unwrap().to_owned();
+                        };
                         let id = req.id.to_owned();
                         let res = self.handle_client_request(client.clone(), req).await;
 
@@ -864,7 +867,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                         }
                     }
                     if let Some(client) = self.clients.get(&client) {
-                        client.write(serde_json::to_string(&results).unwrap().as_bytes())?;
+                        client.write(serde_json::to_string(&results)?.as_bytes())?;
                     }
                 } else {
                     let res = json!({
@@ -877,7 +880,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                         "id": null
                     });
                     if let Some(client) = self.clients.get(&client) {
-                        client.write(serde_json::to_string(&res).unwrap().as_bytes())?;
+                        client.write(serde_json::to_string(&res)?.as_bytes())?;
                     }
                 }
             }
@@ -890,7 +893,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         Ok(())
     }
 
-    fn wallet_notify(&self, transactions: &[(Transaction, TxOut)]) {
+    fn wallet_notify(&self, transactions: &[(Transaction, TxOut)]) -> Result<(), crate::error::Error> {
         for (_, out) in transactions {
             let hash = get_spk_hash(&out.script_pubkey);
             if let Some(client) = self.client_addresses.get(&hash) {
@@ -910,13 +913,15 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                     "params": [hash, status_hash]
                 });
 
-                try_and_log!(client.write(serde_json::to_string(&notify).unwrap().as_bytes()));
+                try_and_log!(client.write(serde_json::to_string(&notify)?.as_bytes()));
             }
         }
+        Ok(())
     }
 }
 
 /// Listens to new TCP connections in a loop
+#[allow(clippy::expect_used, reason = "INVARIANT: unbounded channel failure implies reactor died")]
 pub async fn client_accept_loop(
     listener: Arc<TcpListener>,
     message_transmitter: UnboundedSender<Message>,
@@ -937,7 +942,7 @@ pub async fn client_accept_loop(
                         ));
                         message_transmitter
                             .send(Message::NewClient((client.client_id, client)))
-                            .expect("Main loop is broken");
+                            .expect("BUG: Main loop is broken");
                         id_count += 1;
                     }
                     Err(e) => {
@@ -948,7 +953,7 @@ pub async fn client_accept_loop(
                 let client = Arc::new(Client::new(id_count, stream, message_transmitter.clone()));
                 message_transmitter
                     .send(Message::NewClient((client.client_id, client)))
-                    .expect("Main loop is broken");
+                    .expect("BUG: Main loop is broken");
                 id_count += 1;
             }
         }
@@ -1022,6 +1027,7 @@ macro_rules! get_arg {
 
 #[cfg(test)]
 mod test {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use core::str::FromStr;
     use std::io;
     use std::sync::Arc;

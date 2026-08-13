@@ -136,7 +136,7 @@ where
     }
 
     #[inline]
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::expect_used, reason = "INVARIANT: we checked that peers isn't empty")]
     pub(crate) fn send_to_random_peer(
         &mut self,
         req: NodeRequest,
@@ -160,7 +160,7 @@ where
 
         let peer = peers
             .choose(&mut rand::rng())
-            .expect("INVARIANT: we checked that peers isn't empty");
+            .expect("BUG: we checked that peers isn't empty");
 
         self.peers
             .get(peer)
@@ -216,7 +216,7 @@ where
         peer.services.has(needs)
     }
 
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::expect_used, reason = "INVARIANT: system time is after 1970")]
     pub(crate) fn handle_peer_ready(
         &mut self,
         peer: u32,
@@ -261,7 +261,7 @@ where
         if version.kind == ConnectionKind::Feeler {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("INVARIANT: system time is after 1970")
+                .expect("BUG: system time is after 1970")
                 .as_secs();
 
             self.address_man
@@ -306,7 +306,7 @@ where
                         AddressState::Tried(
                             SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
-                                .expect("INVARIANT: system time is after 1970")
+                                .expect("BUG: system time is after 1970")
                                 .as_secs(),
                         ),
                     );
@@ -422,7 +422,7 @@ where
 
     /// Handles peer messages where behavior is common to all node contexts, returning `Some` only
     /// for peer messages that require context-specific handling.
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::expect_used, reason = "INVARIANT: we just found it in inflight_user_requests")]
     pub(crate) fn handle_peer_msg_common(
         &mut self,
         msg: PeerMessages,
@@ -459,7 +459,7 @@ where
 
                 match req {
                     Some(req) => {
-                        let final_req = self.inflight_user_requests.remove(&req).expect("INVARIANT: we just found it in inflight_user_requests");
+                        let final_req = self.inflight_user_requests.remove(&req).expect("BUG: we just found it in inflight_user_requests");
                         let _ = final_req.2.send(NodeResponse::CFilterHeaders(cfheaders));
                     }
 
@@ -475,7 +475,7 @@ where
         }
     }
 
-    #[allow(clippy::expect_used)]
+    #[allow(clippy::expect_used, reason = "INVARIANT: system time is after 1970")]
     pub(crate) fn handle_disconnection(&mut self, peer: u32, idx: usize) -> Result<(), WireError> {
         if let Some(p) = self.peers.remove(&peer) {
             if p.is_long_lived() && p.state == PeerStatus::Ready {
@@ -486,7 +486,7 @@ where
 
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("INVARIANT: system time is after 1970")
+                .expect("BUG: system time is after 1970")
                 .as_secs();
 
             match p.state {
