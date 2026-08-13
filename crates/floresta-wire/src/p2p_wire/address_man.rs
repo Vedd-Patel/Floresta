@@ -1122,6 +1122,7 @@ impl AddressMan {
     ///
     /// This is a last-resort method to try to connect to a peer, if we don't have any other
     /// addresses to connect to.
+    #[allow(clippy::expect_used, reason = "INVARIANT: parsing static string")]
     pub(crate) fn add_fixed_addresses(&mut self, network: Network) {
         let addresses = Self::get_net_seeds(network);
         let peers: Vec<DiskLocalAddress> =
@@ -1333,6 +1334,7 @@ pub mod dns_proxy {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod test {
     use std::fs::File;
     use std::io::Read;

@@ -162,6 +162,7 @@ where
     /// If we get an empty headers message, we'll check what to do next, depending on
     /// our current state. We may poke our peers to see if they have an alternative tip,
     /// or we may just finish the IBD, if no one have an alternative tip.
+    #[allow(clippy::expect_used)]
     async fn handle_headers(
         &mut self,
         peer: PeerId,
@@ -184,7 +185,7 @@ where
 
                 self.disconnect_and_ban(peer)?;
 
-                let peer = self.peers.get(&peer).unwrap();
+                let peer = self.peers.get(&peer).ok_or(WireError::PeerNotFound)?;
                 self.common.address_man.update_set_state(
                     peer.address.id,
                     AddressState::Banned(ChainSelector::BAN_TIME),
@@ -192,7 +193,7 @@ where
             }
         }
 
-        let last = headers.last().unwrap().block_hash();
+        let last = headers.last().expect("INVARIANT: headers is not empty").block_hash();
         self.context
             .tip_cache
             .entry(peer)
@@ -328,7 +329,7 @@ where
                 height -= interval / 2;
             }
 
-            hash = self.chain.get_block_hash(height).unwrap();
+            hash = self.chain.get_block_hash(height)?;
         }
         info!("Fork point is around height={height} hash={hash}");
         // at the end, this variable should hold the last block where they agreed
@@ -425,7 +426,7 @@ where
 
         let (leaf_data, proof, _) = inflight_block
             .aux_data
-            .expect("Block proof and leaf data should be present");
+            .ok_or(WireError::BlockProofNotFound)?;
 
         let acc1 = self.update_acc(agreed, &inflight_block.block, proof, &leaf_data, fork + 1)?;
 
@@ -548,6 +549,7 @@ where
     /// This method will find what the accumulator looks like for a block with (height, hash).
     /// Check-out [this](https://blog.dlsouza.lol/2023/09/28/pow-fraud-proof.html) post
     /// to learn how the cut-and-choose protocol works
+    #[allow(clippy::expect_used)]
     async fn find_accumulator_for_block(
         &mut self,
         height: u32,
@@ -608,7 +610,7 @@ where
         //we should have only one candidate left
         assert_eq!(candidate_accs.len(), 1);
 
-        Self::parse_acc(&candidate_accs.pop().unwrap().1)
+        Self::parse_acc(&candidate_accs.pop().expect("INVARIANT: candidate_accs has exactly 1 element").1)
     }
 
     /// If we get an empty `headers` message, our next action depends on which state are
@@ -638,7 +640,7 @@ where
                 if let Some(assume_utreexo) = self.common.config.assume_utreexo.as_ref() {
                     self.context.state = ChainSelectorState::Done;
                     // already assumed the chain
-                    if self.chain.get_validation_index().unwrap() >= assume_utreexo.height {
+                    if self.chain.get_validation_index()? >= assume_utreexo.height {
                         return Ok(());
                     }
                     info!(
@@ -686,7 +688,7 @@ where
         let block = self.get_block_and_proof(rand_peer, fork).await?;
         let (leaf_data, proof, _) = block
             .aux_data
-            .expect("Block proof and leaf data should be present");
+            .ok_or(WireError::BlockProofNotFound)?;
 
         let (del_hashes, inputs) =
             proof_util::process_proof(&leaf_data, &block.block.txdata, fork_height, |h| {
@@ -742,7 +744,7 @@ where
                 );
 
                 self.context.state = ChainSelectorState::Done;
-                self.chain.mark_chain_as_assumed(acc, tips[0]).unwrap();
+                self.chain.mark_chain_as_assumed(acc, tips[0])?;
                 self.chain.update_ibd(IBDState::Done);
             }
             // if we have more than one tip, we need to check if our best chain has an invalid block
@@ -786,7 +788,7 @@ where
     /// we'll download that fork and compare with our own chain. We should always pick
     /// the most PoW one.
     fn poke_peers(&self) -> Result<(), WireError> {
-        let locator = self.chain.get_block_locator().unwrap();
+        let locator = self.chain.get_block_locator()?;
         for peer in self.common.peer_ids.iter() {
             let get_headers = NodeRequest::GetHeaders(locator.clone());
             self.send_to_peer(*peer, get_headers)?;
@@ -906,13 +908,14 @@ where
         Ok(LoopControl::Continue)
     }
 
+    #[allow(clippy::expect_used)]
     async fn find_accumulator_for_block_step(
         &mut self,
         block: BlockHash,
         height: u32,
     ) -> Result<FindAccResult, WireError> {
         for peer_id in self.common.peer_ids.iter() {
-            let peer = self.peers.get(peer_id).unwrap();
+            let peer = self.peers.get(peer_id).ok_or(WireError::PeerNotFound)?;
             if peer.services.has(service_flags::UTREEXO_ARCHIVE.into()) {
                 self.send_to_peer(*peer_id, NodeRequest::GetUtreexoState((block, height)))?;
                 self.common.inflight.insert(
@@ -962,7 +965,7 @@ where
 
         if peer_accs.len() == 1 {
             warn!("Only one peers with the UTREEXO_FILTER service flag");
-            return Ok(FindAccResult::Found(peer_accs.pop().unwrap().1));
+            return Ok(FindAccResult::Found(peer_accs.pop().expect("INVARIANT: peer_accs has exactly 1 element").1));
         }
 
         let mut accs = HashSet::new();
@@ -972,7 +975,7 @@ where
 
         // if all peers have the same state, we can assume it's the correct one
         if accs.len() == 1 {
-            return Ok(FindAccResult::Found(peer_accs.pop().unwrap().1));
+            return Ok(FindAccResult::Found(peer_accs.pop().expect("INVARIANT: peer_accs has at least 1 element").1));
         }
 
         // if we have different states, we need to keep looking until we find the
@@ -1022,7 +1025,7 @@ where
             PeerMessages::Ready(version) => {
                 self.handle_peer_ready(peer, version)?;
                 if matches!(self.context.state, ChainSelectorState::LookingForForks(_)) {
-                    let locator = self.chain.get_block_locator().unwrap();
+                    let locator = self.chain.get_block_locator()?;
                     self.send_to_peer(peer, NodeRequest::GetHeaders(locator))?;
                 }
             }
@@ -1054,6 +1057,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use std::sync::Arc;
 
     use floresta_chain::ChainState;

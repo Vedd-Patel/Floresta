@@ -210,20 +210,19 @@ where
                     return Ok(false);
                 }
 
-                let acc = Stump::deserialize(&state[..(state.len() - 8)]).unwrap();
+                let acc = Stump::deserialize(&state[..(state.len() - 8)]).map_err(|_| WireError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupted backfill state")))?;
                 let tip = u32::from_le_bytes(
                     state[(state.len() - 8)..(state.len() - 4)]
                         .try_into()
-                        .unwrap(),
+                        .map_err(|_| WireError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupted backfill state")))?,
                 );
 
-                let end = u32::from_le_bytes(state[(state.len() - 4)..].try_into().unwrap());
+                let end = u32::from_le_bytes(state[(state.len() - 4)..].try_into().map_err(|_| WireError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupted backfill state")))?);
                 info!("Recovering backfill node from state tip={tip}, end={tip}");
 
                 (
                     self.chain
-                        .get_partial_chain(tip, end, acc)
-                        .expect("Failed to get partial chain"),
+                        .get_partial_chain(tip, end, acc)?,
                     end,
                 )
             }
@@ -231,12 +230,10 @@ where
                 // if the file doesn't exist or got corrupted, start from genesis
                 let end = self
                     .chain
-                    .get_validation_index()
-                    .expect("can get the validation index");
+                    .get_validation_index()?;
                 (
                     self.chain
-                        .get_partial_chain(0, end, Stump::default())
-                        .unwrap(),
+                        .get_partial_chain(0, end, Stump::default())?,
                     end,
                 )
             }
@@ -249,8 +246,7 @@ where
             None,
             self.kill_signal.clone(),
             self.address_man.clone(),
-        )
-        .unwrap();
+        )?;
 
         let datadir = self.config.datadir.clone();
         let outer_chain = self.chain.clone();
@@ -259,39 +255,50 @@ where
             backfill,
             move |chain: &PartialChainState| {
                 if chain.has_invalid_blocks() {
-                    panic!("We assumed a chain with invalid blocks, something went really wrong");
+                    error!("We assumed a chain with invalid blocks, something went really wrong");
+                    return;
                 }
 
-                done_flag.send(()).unwrap();
+                if let Err(_) = done_flag.send(()) {
+                    error!("Failed to send done flag");
+                }
 
                 // we haven't finished the backfill yet, save the current state for the next run
                 if chain.is_in_ibd() {
                     let acc = chain.get_acc();
-                    let tip = chain.get_height().unwrap();
-                    let mut ser_acc = Vec::new();
-                    acc.serialize(&mut ser_acc).unwrap();
-                    ser_acc.extend_from_slice(&tip.to_le_bytes());
-                    ser_acc.extend_from_slice(&end.to_le_bytes());
-                    std::fs::write(datadir.join(".sync_node_state"), ser_acc)
-                        .expect("Failed to write sync node state");
+                    if let Ok(tip) = chain.get_height() {
+                        let mut ser_acc = Vec::new();
+                        if let Err(e) = acc.serialize(&mut ser_acc) {
+                            error!("Failed to serialize acc: {:?}", e);
+                        } else {
+                            ser_acc.extend_from_slice(&tip.to_le_bytes());
+                            ser_acc.extend_from_slice(&end.to_le_bytes());
+                            if let Err(e) = std::fs::write(datadir.join(".sync_node_state"), ser_acc) {
+                                error!("Failed to write sync node state: {:?}", e);
+                            }
+                        }
+                    } else {
+                        error!("Failed to get chain height");
+                    }
                     return;
                 }
 
                 // empty the file if we're done
-                std::fs::write(datadir.join(".sync_node_state"), Vec::new())
-                    .expect("Failed to write sync node state");
+                if let Err(e) = std::fs::write(datadir.join(".sync_node_state"), Vec::new()) {
+                    error!("Failed to empty sync node state: {:?}", e);
+                }
 
                 for block in chain.list_valid_blocks() {
-                    outer_chain
-                        .mark_block_as_valid(block.block_hash())
-                        .expect("Failed to mark block as valid");
+                    if let Err(e) = outer_chain.mark_block_as_valid(block.block_hash()) {
+                        error!("Failed to mark block as valid: {:?}", e);
+                    }
                 }
 
                 info!("Backfilling task shutting down...");
             },
         );
 
-        tokio::task::spawn(fut);
+        let _ = tokio::task::spawn(fut);
         Ok(true)
     }
 
@@ -323,8 +330,13 @@ where
         let is_backfilling = match self.config.backfill {
             true => {
                 info!("Starting backfill task...");
-                self.backfill(sender)
-                    .expect("Failed to spawn backfill thread")
+                match self.backfill(sender) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("Failed to spawn backfill thread: {e:?}");
+                        return;
+                    }
+                }
             }
             false => false,
         };
@@ -350,18 +362,9 @@ where
 
         self.last_block_request = self.chain.get_validation_index().unwrap_or(0);
         if let Some(ref cfilters) = self.block_filters {
-            self.last_filter = self
-                .chain
-                .get_block_hash(cfilters.get_height().unwrap_or(1))
-                .unwrap();
-        }
-
-        self.last_block_request = self.chain.get_validation_index().unwrap_or(0);
-        if let Some(ref cfilters) = self.block_filters {
-            self.last_filter = self
-                .chain
-                .get_block_hash(cfilters.get_height().unwrap_or(1))
-                .unwrap();
+            if let Ok(hash) = self.chain.get_block_hash(cfilters.get_height().unwrap_or(1)) {
+                self.last_filter = hash;
+            }
         }
 
         let mut ticker = time::interval(RunningNode::MAINTENANCE_TICK);
@@ -538,8 +541,8 @@ where
     }
 
     fn ask_missed_block(&mut self) -> Result<(), WireError> {
-        let tip = self.chain.get_height().unwrap();
-        let next = self.chain.get_validation_index().unwrap();
+        let tip = self.chain.get_height()?;
+        let next = self.chain.get_validation_index()?;
         if tip == next {
             return Ok(());
         }
@@ -596,13 +599,13 @@ where
         // this catches an edge-case where all our utreexo peers are gone, and the GetData
         // times-out. That yields an error, but doesn't ask the block again. Our last_block_request
         // will be pointing to a block that will never arrive, so we basically deadlock.
-        self.last_block_request = self.chain.get_validation_index().unwrap();
+        self.last_block_request = self.chain.get_validation_index()?;
         // update this or we'll get this warning every second after 15 minutes without a block,
         // until we get a new block.
         self.last_tip_update = Instant::now();
         self.create_connection(ConnectionKind::Extra)?;
         self.send_to_random_peer(
-            NodeRequest::GetHeaders(self.chain.get_block_locator().unwrap()),
+            NodeRequest::GetHeaders(self.chain.get_block_locator()?),
             ServiceFlags::NONE,
         )?;
         Ok(())
@@ -617,7 +620,7 @@ where
             return Ok(());
         }
 
-        let locator = self.chain.get_block_locator().unwrap();
+        let locator = self.chain.get_block_locator()?;
         self.send_to_peer(peer, NodeRequest::GetHeaders(locator))?;
 
         self.inflight
@@ -709,7 +712,7 @@ where
                         );
                         self.inflight.remove(&InflightRequests::Headers);
 
-                        let peer_info = self.peers.get(&peer).cloned().expect("Peer not found");
+                        let peer_info = self.peers.get(&peer).cloned().ok_or(WireError::PeerNotFound)?;
                         let is_extra = matches!(peer_info.kind, ConnectionKind::Extra);
 
                         if is_extra {
