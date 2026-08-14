@@ -113,6 +113,10 @@ pub mod jsonrpc_interface {
         pub data: Option<Value>,
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: RpcError implements Serialize, so to_string cannot fail"
+    )]
     impl Display for RpcError {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             write!(

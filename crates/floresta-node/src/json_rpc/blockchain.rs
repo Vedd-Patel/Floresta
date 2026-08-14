@@ -605,6 +605,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     /// watch-only wallet which may not have the transaction cached.
     ///
     /// Not finding one of the specified transactions will raise [`JsonRpcError::TxNotFound`].
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: encoding to a Vec<u8> writer is infallible"
+    )]
     pub(super) async fn get_txout_proof(
         &self,
         tx_ids: &[Txid],
@@ -644,7 +648,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let mut bytes: Vec<u8> = Vec::new();
         merkle_block
             .consensus_encode(&mut bytes)
-            .expect("This will raise if a writer error happens");
+            .expect("BUG: This will raise if a writer error happens");
         Ok(GetTxOutProof(bytes.to_lower_hex_string()))
     }
 
@@ -662,6 +666,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
     // floresta flavored rpcs. These are not part of the bitcoin rpc spec
     // findtxout
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: all RPC response types implement Serialize"
+    )]
     pub(super) async fn find_tx_out(
         &self,
         txid: Txid,

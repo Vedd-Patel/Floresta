@@ -95,6 +95,9 @@ pub enum WireError {
 
     /// Couldn't find the leaf data for a block
     LeafDataNotFound,
+
+    /// We assumed a chain with invalid blocks, something went really wrong
+    AssumedChainInvalid,
 }
 
 impl Display for WireError {
@@ -142,6 +145,7 @@ impl Display for WireError {
                 "We tried to work on a block that we don't have a proof for yet"
             ),
             Self::LeafDataNotFound => write!(f, "Couldn't find the leaf data for a block"),
+            Self::AssumedChainInvalid => write!(f, "We assumed a chain with invalid blocks, something went really wrong"),
         }
     }
 }

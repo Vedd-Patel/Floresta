@@ -298,6 +298,10 @@ impl Florestad {
         self.stop_signal.clone()
     }
 
+    #[allow(
+        clippy::unwrap_used,
+        reason = "INVARIANT: Mutex poisoning only occurs on a prior panic, which is a bug"
+    )]
     pub async fn wait_shutdown(&self) {
         let chan = {
             let mut guard = self.stop_notify.lock().unwrap();
@@ -313,6 +317,10 @@ impl Florestad {
     /// it will be resolved using the system's DNS resolver. This function will
     /// propagate a [FlorestadError] if it fails to resolve the hostname or the
     /// provided address is invalid.
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: split(':') on a non-empty string always yields at least one element"
+    )]
     fn resolve_hostname(hostname: &str, default_port: u16) -> Result<SocketAddr, FlorestadError> {
         if !hostname.contains(':') {
             return hostname
@@ -328,7 +336,7 @@ impl Florestad {
                 let mut split = hostname.split(':');
                 let hostname = split
                     .next()
-                    .expect("First element of the iterator is `Some`");
+                    .expect("BUG: First element of the iterator is `Some`");
 
                 debug!("Resolving hostname: {hostname}");
 
@@ -506,11 +514,16 @@ impl Florestad {
             .as_ref()
             .map(|addr| Self::resolve_hostname(addr, default_electrum_port))
             .transpose()?
-            .unwrap_or(
-                format!("127.0.0.1:{default_electrum_port}")
+            .unwrap_or({
+                #[allow(
+                    clippy::expect_used,
+                    reason = "INVARIANT: hardcoded format string produces a valid socket address"
+                )]
+                let addr = format!("127.0.0.1:{default_electrum_port}")
                     .parse()
-                    .expect("Hardcoded address"),
-            );
+                    .expect("BUG: Hardcoded address");
+                addr
+            });
         // sans-TLS Electrum listener.
         let non_tls_listener = TcpListener::bind(electrum_addr)
             .await
@@ -536,11 +549,16 @@ impl Florestad {
                 .as_ref()
                 .map(|addr| Self::resolve_hostname(addr, default_electrum_port_tls))
                 .transpose()?
-                .unwrap_or(
-                    format!("127.0.0.1:{default_electrum_port_tls}")
+                .unwrap_or({
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "INVARIANT: hardcoded format string produces a valid socket address"
+                    )]
+                    let addr = format!("127.0.0.1:{default_electrum_port_tls}")
                         .parse()
-                        .expect("Hardcoded address"),
-                );
+                        .expect("BUG: Hardcoded address");
+                    addr
+                });
 
             // Generate self-signed TLS certificate, if enabled.
             if self.config.generate_cert {
@@ -597,6 +615,10 @@ impl Florestad {
         // Chain provider
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
+        #[allow(
+            clippy::unwrap_used,
+            reason = "INVARIANT: Mutex poisoning only occurs on a prior panic, which is a bug"
+        )]
         let mut recv = self.stop_notify.lock().unwrap();
         *recv = Some(receiver);
 

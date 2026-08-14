@@ -63,10 +63,10 @@ use crate::json_rpc::res::RescanConfidence;
 use crate::json_rpc::res::jsonrpc_interface::Response;
 
 /// Expect message for `serde_json` serialization of types that implement `Serialize`.
-pub(super) const SERIALIZATION_EXPECT_MSG: &str = "types used in RPC responses implement Serialize";
+pub(super) const SERIALIZATION_EXPECT_MSG: &str = "BUG: types used in RPC responses implement Serialize";
 
 /// Expect message for HTTP response builder with hardcoded valid headers.
-pub(super) const HTTP_RESPONSE_EXPECT: &str = "HTTP response built from valid hardcoded headers";
+pub(super) const HTTP_RESPONSE_EXPECT: &str = "BUG: HTTP response built from valid hardcoded headers";
 
 /// The server holds this to tell which rpc method is awaiting to be processed and when the request were made.
 pub(super) struct InflightRpc {
@@ -203,6 +203,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "INVARIANT: all RPC response types implement Serialize and HTTP headers are hardcoded valid values"
+)]
 async fn handle_json_rpc_request(
     req: RpcRequest,
     state: Arc<RpcImpl<impl RpcChain>>,
@@ -343,7 +347,7 @@ async fn handle_json_rpc_request(
             state
                 .get_block(hash, verbosity)
                 .await
-                .map(|v| serde_json::to_value(v).expect("GetBlockRes implements serde"))
+                .map(|v| serde_json::to_value(v).expect("BUG: GetBlockRes implements serde"))
         }
 
         "getblockfrompeer" => {
@@ -455,6 +459,10 @@ async fn handle_json_rpc_request(
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "INVARIANT: all RPC response types implement Serialize and HTTP headers are hardcoded valid values"
+)]
 async fn json_rpc_request(
     State(state): State<Arc<RpcImpl<impl RpcChain>>>,
     body: Bytes,
@@ -658,6 +666,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: hardcoded address string is always valid; listener local_addr succeeds after a successful bind; axum::serve failing means we cannot run at all"
+    )]
     pub async fn create(
         chain: Blockchain,
         wallet: Arc<AddressCache<KvDatabase>>,
@@ -673,14 +685,14 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let address = address.unwrap_or_else(|| {
             format!("127.0.0.1:{}", network.default_rpc_port())
                 .parse()
-                .expect("hardcoded address is valid")
+                .expect("BUG: hardcoded address is valid")
         });
 
         let listener = match tokio::net::TcpListener::bind(address).await {
             Ok(listener) => {
                 let local_addr = listener
                     .local_addr()
-                    .expect("Infallible: listener binding was `Ok`");
+                    .expect("BUG: listener binding was `Ok`");
                 info!("RPC server is running at {local_addr}");
                 listener
             }
@@ -715,7 +727,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
         axum::serve(listener, router)
             .await
-            .expect("failed to start rpc server");
+            .expect("BUG: failed to start rpc server");
     }
 }
 
@@ -806,6 +818,7 @@ fn try_parse_and_format_signature(signature_bytes: &[u8]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, reason = "test code")]
     use super::*;
 
     #[test]
