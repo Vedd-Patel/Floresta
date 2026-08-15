@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #![no_main]
-
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "fuzz harness: a panic is how the fuzzer reports a finding"
+)]
 use std::io::Cursor;
 
 use arbitrary::Arbitrary;

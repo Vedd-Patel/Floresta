@@ -1,5 +1,11 @@
 #![no_main]
-
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "fuzz harness: a panic is how the fuzzer reports a finding"
+)]
 use floresta_wire::onion::OnionV3Addr;
 use libfuzzer_sys::fuzz_target;
 
