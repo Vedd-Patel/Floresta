@@ -225,7 +225,7 @@ where
     {
         loop {
             let best_block = self.chain.get_best_block()?.0;
-            let next_block = self.chain.get_validation_index()? + 1;
+            let next_block = self.chain.get_validation_index()?.saturating_add(1);
             if next_block > best_block {
                 // If we are at the best block, we don't need to process any more blocks
                 return Ok(());
@@ -253,6 +253,11 @@ where
             {
                 use metrics::get_metrics;
 
+                #[allow(
+                    clippy::expect_used,
+                    reason = "the add() on the line above guarantees at least one sample, so \
+                              the EMA always has a value here"
+                )]
                 let avg = self.block_sync_avg.value().expect("at least one sample");
                 let metrics = get_metrics();
                 metrics.avg_block_processing_time.set(avg);
@@ -319,7 +324,17 @@ where
             BlockchainError::AccumulatorError(_) | BlockchainError::InvalidUtreexoProof => {
                 Some(BlockValidationErrors::InvalidUtreexoProof)
             }
-            _ => None,
+            // These are not per-block validation failures, so there is no
+            // BlockValidationErrors to report for them.
+            BlockchainError::BlockNotPresent
+            | BlockchainError::OrphanOrInvalidBlock
+            | BlockchainError::UtreexoLeaf(_)
+            | BlockchainError::Database(_)
+            | BlockchainError::ChainNotInitialized
+            | BlockchainError::InvalidTip(_)
+            | BlockchainError::BadValidationIndex
+            | BlockchainError::OperationOverflow(_)
+            | BlockchainError::Unsupported(_) => None,
         }
     }
 

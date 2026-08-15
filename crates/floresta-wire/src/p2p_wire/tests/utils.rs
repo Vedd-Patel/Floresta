@@ -301,7 +301,7 @@ pub async fn setup_node(
     datadir: impl AsRef<Path>,
     num_blocks: usize,
 ) -> Arc<ChainState<FlatChainStore>> {
-    let config = FlatChainStoreConfig::new_with_path(&datadir);
+    let config = FlatChainStoreConfig::new(&datadir);
 
     let chainstore = FlatChainStore::new(config).unwrap();
     let mempool = Arc::new(Mutex::new(Mempool::new(1000)));
@@ -374,6 +374,17 @@ pub async fn setup_node(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use bitcoin::BlockHash;
     use bitcoin::consensus::deserialize;

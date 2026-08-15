@@ -198,6 +198,24 @@ pub enum PeerError {
     Transport(TransportError),
 }
 
+impl std::error::Error for PeerError {
+    /// Exposes the read, parse or transport failure behind this peer error.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(e) => Some(e),
+            Self::Parse(e) => Some(e),
+            Self::Transport(e) => Some(e),
+            Self::Send
+            | Self::UnexpectedMessage
+            | Self::MessageTooBig
+            | Self::MagicBitsMismatch
+            | Self::TooManyMessages
+            | Self::PingTimeout
+            | Self::Channel => None,
+        }
+    }
+}
+
 impl Display for PeerError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -436,8 +454,14 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                 };
 
                 self.write(NetworkMessage::Unknown {
-                    command: CommandString::try_from_static(GET_UTREEXO_PROOF_CMD)
-                        .expect("Invalid command string"),
+                    command: {
+                        #[allow(
+                            clippy::expect_used,
+                            reason = "GET_UTREEXO_PROOF_CMD is a valid ASCII command constant"
+                        )]
+                        CommandString::try_from_static(GET_UTREEXO_PROOF_CMD)
+                            .expect("Invalid command string")
+                    },
                     payload: serialize(&get_block_proof),
                 })
                 .await?;
@@ -460,19 +484,26 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
         Ok(())
     }
 
+    // `NetworkMessage` is rust-bitcoin's ~36-variant message enum. Enumerating every variant
+    // we deliberately ignore would add no safety here and would break on every upstream
+    // release; the wildcard arms below are "ignore anything we don't handle".
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "foreign non-error enum with many irrelevant variants; see comment above"
+    )]
     pub async fn handle_peer_message(
         &mut self,
         message: NetworkMessage,
         time: Instant,
     ) -> Result<()> {
         self.last_message = time;
-        self.messages += 1;
+        self.messages = self.messages.saturating_add(1);
 
         debug!("Received {} from peer {}", message.command(), self.id);
         match self.state {
             State::Connected => match message {
                 NetworkMessage::Inv(inv) => {
-                    let mut block_inv_elements = 0;
+                    let mut block_inv_elements: u32 = 0;
 
                     // Silently drop
                     if self.last_inv.elapsed() < INV_MESSAGE_INTERVAL {
@@ -488,14 +519,17 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                             Inventory::Block(block_hash)
                             | Inventory::WitnessBlock(block_hash)
                             | Inventory::CompactBlock(block_hash) => {
-                                block_inv_elements += 1;
+                                block_inv_elements = block_inv_elements.saturating_add(1);
                                 if block_inv_elements >= MAX_BLOCKS_PER_INV {
                                     return Err(PeerError::MessageTooBig);
                                 }
 
                                 self.send_to_node(PeerMessages::NewBlock(block_hash), time);
                             }
-                            _ => {}
+                            // Witness txids and unknown inventory kinds carry nothing we act on.
+                            Inventory::WTx(_)
+                            | Inventory::WitnessTransaction(_)
+                            | Inventory::Unknown { .. } => {}
                         }
                     }
                 }
@@ -569,6 +603,10 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     self.last_ping = None;
                 }
                 NetworkMessage::Unknown { command, payload } => {
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "UTREEXO_PROOF_CMD_STRING is a valid ASCII command constant"
+                    )]
                     let utreexo_proof_cmd =
                         CommandString::try_from_static(UTREEXO_PROOF_CMD_STRING)
                             .expect("Invalid command string");
@@ -701,7 +739,14 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
                     self.write(NetworkMessage::Tx(tx)).await?;
                 }
             }
-            _ => {}
+            // We only serve transactions from our mempool; block inventory is served by the
+            // node itself, and the remaining kinds carry nothing we can answer.
+            Inventory::Error
+            | Inventory::Block(_)
+            | Inventory::CompactBlock(_)
+            | Inventory::WTx(_)
+            | Inventory::WitnessBlock(_)
+            | Inventory::Unknown { .. } => {}
         }
         Ok(())
     }
@@ -729,8 +774,12 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
             mempool,
             last_ping: None,
             last_message: Instant::now(),
-            last_inv: Instant::now() - INV_MESSAGE_INTERVAL,
-            last_addrv2: Instant::now() - ADDRV2_MESSAGE_INTERVAL,
+            last_inv: Instant::now()
+                .checked_sub(INV_MESSAGE_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            last_addrv2: Instant::now()
+                .checked_sub(ADDRV2_MESSAGE_INTERVAL)
+                .unwrap_or_else(Instant::now),
             node_tx,
             services: ServiceFlags::NONE,
             time_offset: 0,
@@ -760,6 +809,7 @@ impl<T: AsyncWrite + Unpin + Send + Sync> Peer<T> {
     }
 
     async fn handle_version(&mut self, version: VersionMessage) -> Result<()> {
+        #[allow(clippy::expect_used, reason = "invariant above")]
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should not be before UNIX epoch")
@@ -818,6 +868,10 @@ pub(super) mod peer_utils {
         let services = advertised_services();
 
         // The current UNIX timestamp.
+        #[allow(
+            clippy::expect_used,
+            reason = "the system clock is after 1970 on any machine that can run a node"
+        )]
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Great Scott!")
@@ -912,6 +966,17 @@ pub enum PeerMessages {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use std::net::Ipv4Addr;
     use std::sync::Arc;

@@ -102,5 +102,21 @@ pub mod peer;
 pub mod socks;
 #[cfg(test)]
 #[doc(hidden)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
+#[allow(
+    clippy::redundant_field_names,
+    reason = "emitted by #[derive(Constructor)] on the simulated-peer fixtures, which we \
+              cannot write differently without dropping the derive"
+)]
 pub mod tests;
 pub mod transport;

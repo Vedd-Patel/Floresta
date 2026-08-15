@@ -159,7 +159,7 @@ impl TryFrom<&[u8]> for OnionVersion {
             return Err(InvalidLength);
         }
 
-        let version = value[0];
+        let version = *value.first().ok_or(InvalidLength)?;
         Ok(Self(version))
     }
 }
@@ -172,6 +172,7 @@ impl TryFrom<AddrV2> for OnionV3Addr {
             return Err(FromAddrV2Error);
         };
 
+        #[allow(clippy::expect_used, reason = "invariant above")]
         let pubkey: OnionPubkey =
             OnionPubkey::try_from(key.as_slice()).expect("This is always 32-bytes");
 
@@ -269,6 +270,10 @@ impl OnionV3Addr {
     ///
     /// These should be serialized as a byte-array and hashed. The checksum will be resulting
     /// hash's two lowest bytes.
+    #[allow(
+        clippy::expect_used,
+        reason = "the target is an in-memory hasher, whose Write impl never returns Err"
+    )]
     pub fn checksum(&self) -> OnionChecksum {
         let mut hash = Sha3_256::new();
 
@@ -288,6 +293,10 @@ impl OnionV3Addr {
 
         let digest = hash.finalize();
         let mut final_checksum = [0; CHECKSUM_LENGTH];
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "Sha3-256 always produces 32 bytes, well above CHECKSUM_LENGTH"
+        )]
         final_checksum.copy_from_slice(&digest[0..CHECKSUM_LENGTH]);
 
         final_checksum.into()
@@ -305,24 +314,25 @@ impl OnionV3Addr {
 
     /// Decodes a [base32] encoded chunk of data.
     ///
-    /// base32 works by dividing the original buffer into groups of 5 bytes (40 bits),
-    /// then further chopping it into subgroups of 5 bits, from the MSB to the LSB. Each
-    /// subgroup is used to index into an alphabet of 32 symbols.
+    /// base32 works by dividing the original buffer into groups of 5 bytes (40 bits), then
+    /// further chopping it into subgroups of 5 bits, from the MSB to the LSB. Each subgroup is
+    /// used to index into an alphabet of 32 symbols. Before doing the first division, the data
+    /// must be padded until the size in bytes is a multiple of 5.
     ///
-    /// Before doing the first division, the data must be padded until the size in bytes is a
-    /// multiple of 5.
-    ///
-    /// For example: foo in binary is 0x666f6f. We must pad it by adding two zero-bytes:
-    /// 0x666f6f0000.
-    ///
-    /// If we look at the binary representation, we have: 0110 0110 0110 1111 0110 1111 0000 0000
-    /// regrouping into chunks of 5: 01100 11001 10111 10110 11110 0000000.
-    ///
-    /// In decimal: 12 25 23 22 30.
-    /// If we look this up in the table: `mzxw6`. We can cross-check this with the RFC and note that
-    /// they have the same value, with the addition of a few equals sign (=), this is for padding!
+    /// For example: `foo` in binary is 0x666f6f. We must pad it by adding two zero-bytes:
+    /// 0x666f6f0000. If we look at the binary representation, we have:
+    /// `0110 0110 0110 1111 0110 1111 0000 0000`, regrouping into chunks of 5:
+    /// `01100 11001 10111 10110 11110 0000000`. In decimal: 12 25 23 22 30. If we look this up
+    /// in the table: `mzxw6`. We can cross-check this with the RFC and note that they have the
+    /// same value, with the addition of a few equals signs (=), which is padding.
     ///
     /// [base32]: https://www.rfc-editor.org/rfc/rfc4648
+    #[allow(
+        clippy::expect_used,
+        clippy::arithmetic_side_effects,
+        reason = "the target is an in-memory Vec, whose Write impl never returns Err, and the \
+                  chunk length times 8 bits fits in a u8 because chunks are at most 5 bytes"
+    )]
     fn b32_encode(&self) -> String {
         let mut final_str = String::new();
         let mut writer = Vec::new();
@@ -373,6 +383,7 @@ impl OnionV3Addr {
 
         let mut chunk_encoded = String::new();
         let chunk_as_u64 = u64::from_be_bytes(padded_chunk);
+        #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
         let mut offset = u64::BITS as usize - CHUNK_LENGTH_BYTES;
 
         while total > 0 {
@@ -382,6 +393,11 @@ impl OnionV3Addr {
             offset = offset.saturating_sub(CHUNK_LENGTH_BYTES);
             total = total.saturating_sub(CHUNK_LENGTH_BYTES as u8);
 
+            #[allow(
+                clippy::indexing_slicing,
+                reason = "remainder is masked to five bits, so it is at most 31 and always \
+                          indexes into the 32-character base32 alphabet"
+            )]
             let ch = BASE32_ALPHABET[remainder as usize];
             chunk_encoded.push(ch);
         }
@@ -397,6 +413,7 @@ impl OnionV3Addr {
     /// Decode a chunk of 8 base32 characters.
     fn b32_decode_chunk(chunk: &str) -> Result<[u8; 5], Base32DecodeError> {
         let mut acc = 0_u64;
+        #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
         let mut offset = u64::BITS - CHUNK_LENGTH_BYTES as u32;
         for ch in chunk.chars() {
             if !ch.is_ascii() {
@@ -410,8 +427,15 @@ impl OnionV3Addr {
                     invalid_character: ch,
                 })?;
 
-            acc |= (val << offset) as u64;
-            offset -= CHUNK_LENGTH_BYTES as u32;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "chunk is always 8 characters and offset starts at 64 - 5, stepping \
+                          down by 5 each time, so the shift and subtraction stay in range"
+            )]
+            {
+                acc |= (val << offset) as u64;
+                offset -= CHUNK_LENGTH_BYTES as u32;
+            }
         }
 
         let mut result = [0; CHUNK_LENGTH_BYTES];
@@ -437,9 +461,17 @@ impl OnionV3Addr {
         let chunks = value.len() / B32_STRING_CHUNK_SIZE;
 
         for chunk in 0..chunks {
-            let lo = chunk * B32_STRING_CHUNK_SIZE;
-            let hi = (chunk * B32_STRING_CHUNK_SIZE) + B32_STRING_CHUNK_SIZE;
-            let chunk = &value[lo..hi];
+            #[allow(
+                clippy::arithmetic_side_effects,
+                clippy::indexing_slicing,
+                reason = "`chunks` is `value.len() / B32_STRING_CHUNK_SIZE`, so every `[lo, hi)` \
+                          window computed here lies fully inside `value`"
+            )]
+            let chunk = {
+                let lo = chunk * B32_STRING_CHUNK_SIZE;
+                let hi = lo + B32_STRING_CHUNK_SIZE;
+                &value[lo..hi]
+            };
 
             let decoded = Self::b32_decode_chunk(chunk)?;
             final_vec.extend(decoded);
@@ -465,15 +497,21 @@ impl OnionV3Addr {
             return Err(OnionAddressDecodeError::InvalidLength);
         }
 
-        let pubkey: OnionPubkey = decoded_bytes[0..32]
-            .try_into()
-            .expect("must have 32 bytes left, we've checked it");
-
-        let checksum: OnionChecksum = decoded_bytes[32..34]
-            .try_into()
-            .expect("must have two bytes left, we've checked it");
-
-        let version: OnionVersion = OnionVersion(decoded_bytes[34]);
+        #[allow(
+            clippy::indexing_slicing,
+            clippy::expect_used,
+            reason = "the length check above guarantees exactly ONION_ADDRESS_STR_LENGTH bytes, so all \
+                      three windows below are in bounds and the conversions cannot fail"
+        )]
+        let (pubkey, checksum, version): (OnionPubkey, OnionChecksum, OnionVersion) = (
+            decoded_bytes[0..32]
+                .try_into()
+                .expect("must have 32 bytes left, we've checked it"),
+            decoded_bytes[32..34]
+                .try_into()
+                .expect("must have two bytes left, we've checked it"),
+            OnionVersion(decoded_bytes[34]),
+        );
         if version != ONION_ENCODING_VERSION {
             return Err(OnionAddressDecodeError::InvalidOnionVersion);
         }
@@ -495,6 +533,17 @@ impl OnionV3Addr {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 pub mod tests {
     use bitcoin::p2p::address::AddrV2;
 

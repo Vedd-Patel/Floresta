@@ -82,10 +82,11 @@ where
             .filter(|inflight| matches!(inflight, InflightRequests::Blocks(_)))
             .count();
 
-        let unprocessed_blocks = inflight_blocks + self.blocks.len();
+        let unprocessed_blocks = inflight_blocks.saturating_add(self.blocks.len());
 
         // if we do a request, this will be the new inflight blocks count
-        let next_unprocessed_count = unprocessed_blocks + SyncNode::BLOCKS_PER_GETDATA;
+        let next_unprocessed_count =
+            unprocessed_blocks.saturating_add(SyncNode::BLOCKS_PER_GETDATA);
 
         // if this request would make our inflight queue too long, postpone it
         if next_unprocessed_count > max_inflight_blocks {
@@ -94,8 +95,11 @@ where
 
         let mut blocks = Vec::with_capacity(SyncNode::BLOCKS_PER_GETDATA);
         for _ in 0..SyncNode::BLOCKS_PER_GETDATA {
-            let next_block = self.last_block_request + 1;
-            let validation_index = self.chain.get_validation_index().unwrap();
+            let next_block = self.last_block_request.saturating_add(1);
+            let Ok(validation_index) = self.chain.get_validation_index() else {
+                // Without a validation index we cannot tell which blocks are still missing.
+                break;
+            };
             if next_block <= validation_index {
                 self.last_block_request = validation_index;
             }
@@ -104,7 +108,7 @@ where
             match next_block {
                 Ok(next_block) => {
                     blocks.push(next_block);
-                    self.last_block_request += 1;
+                    self.last_block_request = self.last_block_request.saturating_add(1);
                 }
 
                 Err(_) => {
@@ -119,7 +123,7 @@ where
     }
 
     fn ask_for_missed_blocks(&mut self) -> Result<(), WireError> {
-        let next_request = self.chain.get_validation_index()? + 1;
+        let next_request = self.chain.get_validation_index()?.saturating_add(1);
         let last_block_requested = self.last_block_request;
 
         // we accumulate the hashes of all blocks in [next_request, last_block_requested] here
@@ -182,7 +186,13 @@ where
     ///     - If were low on inflights, requests new blocks to validate.
     pub async fn run(mut self, done_cb: impl FnOnce(&Chain)) -> Self {
         info!("Starting sync node...");
-        self.last_block_request = self.chain.get_validation_index().unwrap();
+        #[allow(clippy::expect_used, reason = "invariant above")]
+        {
+            self.last_block_request = self
+                .chain
+                .get_validation_index()
+                .expect("chainstate is initialised before the sync node starts");
+        }
 
         let mut ticker = time::interval(SyncNode::MAINTENANCE_TICK);
         // If we fall behind, don't "catch up" by running maintenance repeatedly
@@ -230,16 +240,20 @@ where
             return LoopControl::Break;
         }
 
-        let validation_index = self
-            .chain
-            .get_validation_index()
-            .expect("validation index block should present");
-
-        let best_block = self
-            .chain
-            .get_best_block()
-            .expect("best block should present")
-            .0;
+        #[allow(
+            clippy::expect_used,
+            reason = "the chainstate is initialised before the sync node starts, so both of \
+                      these reads succeed for as long as this loop runs"
+        )]
+        let (validation_index, best_block) = (
+            self.chain
+                .get_validation_index()
+                .expect("validation index block should present"),
+            self.chain
+                .get_best_block()
+                .expect("best block should present")
+                .0,
+        );
 
         if validation_index == best_block {
             info!("IBD is finished, switching to normal operation mode");
@@ -334,7 +348,16 @@ where
                         self.get_blocks_to_download();
                     }
 
-                    _ => {}
+                    // Handled by `handle_peer_msg_common`; enumerated so a new variant is
+                    // reviewed here rather than silently ignored.
+                    PeerMessages::NewBlock(_)
+                    | PeerMessages::Headers(_)
+                    | PeerMessages::Addr(_)
+                    | PeerMessages::NotFound(_)
+                    | PeerMessages::Transaction(_)
+                    | PeerMessages::UtreexoState(_)
+                    | PeerMessages::BlockFilter(_)
+                    | PeerMessages::CFHeaders(_) => {}
                 }
             }
         }
