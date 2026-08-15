@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::map_err_ignore,
+    clippy::wildcard_enum_match_arm,
+    reason = "benchmark harness: a panic means the fixture is broken, which should fail the run"
+)]
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::hint::black_box;
@@ -149,7 +162,7 @@ fn initialize_chainstore_benchmark(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let test_id = rand::random::<u64>();
-                FlatChainStoreConfig::new_with_path(format!("./tmp-db/{test_id}/"))
+                FlatChainStoreConfig::new(format!("./tmp-db/{test_id}/"))
             },
             |config| FlatChainStore::new(config).unwrap(),
             BatchSize::SmallInput,
@@ -299,7 +312,7 @@ fn chainstore_checksum_benchmark(c: &mut Criterion) {
     let setup_chain = || {
         let test_id = rand::random::<u64>();
         // The default config with the big mmap sizes that we use in `florestad`
-        let config = FlatChainStoreConfig::new_with_path(format!("./tmp-db/{test_id}/"));
+        let config = FlatChainStoreConfig::new(format!("./tmp-db/{test_id}/"));
         let mut chainstore = FlatChainStore::new(config).unwrap();
 
         headers.iter().enumerate().for_each(|(i, header)| {
