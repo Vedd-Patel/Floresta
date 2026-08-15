@@ -13,12 +13,18 @@ pub struct NetworkFilters<Storage: IterableFilterStore> {
 }
 
 impl<Storage: IterableFilterStore> NetworkFilters<Storage> {
-    pub fn new(filters: Storage) -> Self {
+    /// Wraps a filter store, initialising its height if it has none yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns whichever [`IterableFilterStoreError`] the store reports when the initial
+    /// height cannot be written.
+    pub fn new(filters: Storage) -> Result<Self, IterableFilterStoreError> {
         if filters.get_height().is_err() {
-            filters.set_height(0).unwrap();
+            filters.set_height(0)?;
         }
 
-        Self { filters }
+        Ok(Self { filters })
     }
 
     pub fn match_any(
@@ -34,9 +40,17 @@ impl<Storage: IterableFilterStore> NetworkFilters<Storage> {
         let start_height = start_height.map(|n| n as usize);
 
         for (height, filter) in self.filters.iter(start_height)? {
-            let hash = chain.get_block_hash(height).unwrap();
+            let hash = match chain.get_block_hash(height) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    return Err(IterableFilterStoreError::BlockNotFound {
+                        height,
+                        source: e.to_string(),
+                    });
+                }
+            };
 
-            if filter.match_any(&hash, &mut iter.clone()).unwrap() {
+            if filter.match_any(&hash, &mut iter.clone())? {
                 blocks.push(hash);
             }
 
