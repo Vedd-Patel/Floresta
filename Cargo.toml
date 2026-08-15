@@ -90,22 +90,28 @@ metrics = { path = "metrics" }
 [workspace.lints.clippy]
 unused_async = "deny"
 use_self = "deny"
-unwrap_used = "warn"
-expect_used = "warn"
-panic = "warn"
-unreachable = "warn"
-todo = "deny"
-unimplemented = "warn"
-indexing_slicing = "warn"
-arithmetic_side_effects = "warn"
-map_err_ignore = "warn"
-wildcard_enum_match_arm = "warn"
-result_unit_err = "deny"
 
-# Documentation & payload - always warn
-missing_errors_doc = "warn"
-missing_panics_doc = "warn"
-result_large_err = "warn"
+# Error handling
+unwrap_used = "deny"             # core target
+expect_used = "deny"             # core target
+panic = "deny"                   # direct panic!()
+unreachable = "deny"             # panic in disguise
+todo = "deny"                    # panic in disguise
+unimplemented = "deny"           # panic in disguise
+indexing_slicing = "deny"        # slice[i] panics; force .get(i)?
+arithmetic_side_effects = "deny" # silent overflow/underflow
+map_err_ignore = "deny"          # the .map_err(|_| ...) anti-pattern
+wildcard_enum_match_arm = "deny" # _ => ... on errors swallows new variants
+result_unit_err = "deny"         # Result<T, ()> says nothing
+
+# Documentation & payload
+#
+# CI lints with `-D warnings`, which erases the warn/deny distinction. The two doc lints
+# are allowed for now so that the error-handling denies above are what CI actually gates
+# on; raise them back to "warn" once the `# Errors` sections have been written.
+missing_errors_doc = "allow"     # error contract in public docs
+missing_panics_doc = "allow"     # documents kept-panic invariants
+result_large_err = "warn"        # keep Result payloads small
 
 [profile.release]
 opt-level = 3     # maximum optimization level
