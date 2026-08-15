@@ -54,6 +54,9 @@ pub enum KvDatabaseError {
 
     /// The [`CachedTransaction`] was not found.
     TransactionNotFound,
+
+    /// Invalid txid
+    InvalidTxid(bitcoin::hashes::FromSliceError),
 }
 
 impl Display for KvDatabaseError {
@@ -66,15 +69,33 @@ impl Display for KvDatabaseError {
             Self::TransactionNotFound => {
                 write!(f, "The requested transaction was not found in the database")
             }
+            Self::InvalidTxid(e) => write!(f, "Invalid txid: {e}"),
         }
     }
 }
 
-impl Error for KvDatabaseError {}
+impl Error for KvDatabaseError {
+    /// Exposes the wrapped error so callers can walk the chain back to the original
+    /// failure. Variants that carry no inner error return `None`.
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::KvError(e) => Some(e),
+            Self::SerdeJsonError(e) => Some(e),
+            Self::DeserializeError(e) => Some(e),
+            Self::InvalidTxid(e) => Some(e),
+            Self::WalletNotInitialized | Self::TransactionNotFound => None,
+        }
+    }
+}
 
 impl_error_from!(KvDatabaseError, serde_json::Error, SerdeJsonError);
 impl_error_from!(KvDatabaseError, kv::Error, KvError);
 impl_error_from!(KvDatabaseError, EncodingError, DeserializeError);
+impl_error_from!(
+    KvDatabaseError,
+    bitcoin::hashes::FromSliceError,
+    InvalidTxid
+);
 
 type Result<T> = floresta_common::prelude::Result<T, KvDatabaseError>;
 
@@ -93,7 +114,7 @@ impl AddressCacheDatabase for KvDatabase {
             if *"height" == key || *"desc" == key {
                 continue;
             }
-            let value: Vec<u8> = item.value().unwrap();
+            let value: Vec<u8> = item.value()?;
             let value = serde_json::from_slice(&value)?;
             addresses.push(value);
         }
@@ -101,20 +122,19 @@ impl AddressCacheDatabase for KvDatabase {
     }
 
     /// Save a [`CachedAddress`] to the [`KvDatabase`].
-    fn save(&self, address: &CachedAddress) {
+    fn save(&self, address: &CachedAddress) -> Result<()> {
         let key = address.script_hash.to_string();
-        let value = serde_json::to_vec(&address).expect("Invalid object serialization");
+        let value = serde_json::to_vec(&address)?;
         let bucket = &self.1;
 
-        bucket
-            .set(&key, &value)
-            .expect("Fatal: Database isn't working");
-        bucket.flush().expect("Could not write to disk");
+        bucket.set(&key, &value)?;
+        bucket.flush()?;
+        Ok(())
     }
 
     /// Update a [`CachedAddress`] in the [`KvDatabase`].
-    fn update(&self, address: &CachedAddress) {
-        self.save(address);
+    fn update(&self, address: &CachedAddress) -> Result<()> {
+        self.save(address)
     }
 
     /// Get the height which [`CachedAddress`]es are cached to.
@@ -146,10 +166,7 @@ impl AddressCacheDatabase for KvDatabase {
 
         descriptors.push(String::from(descriptor));
 
-        bucket.set(
-            &String::from("desc"),
-            &serde_json::to_vec(&descriptors).unwrap(),
-        )?;
+        bucket.set(&String::from("desc"), &serde_json::to_vec(&descriptors)?)?;
         bucket.flush()?;
 
         Ok(())
@@ -165,15 +182,14 @@ impl AddressCacheDatabase for KvDatabase {
         Ok(Vec::new())
     }
 
-    /// Get a [`CachedTransaction`] from the [`KvDatabase`], given its [`Txid`].
-    fn get_transaction(&self, txid: &Txid) -> Result<CachedTransaction> {
+    fn get_transaction(&self, txid: &Txid) -> Result<Option<CachedTransaction>> {
         let tx_store = self.0.bucket::<&[u8], Vec<u8>>(Some("transactions"))?;
 
         let transaction = tx_store.get(&txid.as_byte_array().to_vec().as_slice())?;
         if let Some(transaction) = transaction {
-            return Ok(serde_json::de::from_slice(&transaction)?);
+            return Ok(Some(serde_json::de::from_slice(&transaction)?));
         }
-        Err(KvDatabaseError::TransactionNotFound)
+        Ok(None)
     }
 
     /// Save a [`CachedTransaction`] to the [`KvDatabase`].
@@ -199,7 +215,7 @@ impl AddressCacheDatabase for KvDatabase {
         for item in tx_store.iter() {
             let item = item?;
             let key = item.key::<&[u8]>()?;
-            transactions.push(Txid::from_slice(key).unwrap());
+            transactions.push(Txid::from_slice(key)?);
         }
         Ok(transactions)
     }
@@ -228,18 +244,33 @@ impl AddressCacheDatabase for KvDatabase {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod test {
+    use core::error::Error as _;
     use core::str::FromStr;
 
     use bitcoin::Address;
     use bitcoin::Transaction;
+    use bitcoin::Txid;
     use bitcoin::address::NetworkChecked;
     use bitcoin::consensus::deserialize;
+    use bitcoin::hashes::Hash as _;
     use bitcoin::hashes::hex::FromHex;
     use bitcoin::hashes::sha256;
     use floresta_common::get_spk_hash;
 
     use super::KvDatabase;
+    use super::KvDatabaseError;
     use crate::AddressCacheDatabase;
     use crate::CachedAddress;
     use crate::CachedTransaction;
@@ -302,7 +333,10 @@ mod test {
         assert_eq!(db.get_stats().unwrap().address_count, 11);
 
         db.save_transaction(&cache_tx).unwrap();
-        assert_eq!(db.get_transaction(&cache_tx.hash).unwrap(), cache_tx);
+        assert_eq!(
+            db.get_transaction(&cache_tx.hash).unwrap(),
+            Some(cache_tx.clone())
+        );
         assert_eq!(db.list_transactions().unwrap(), vec![cache_tx.hash]);
 
         db.set_cache_height(test_height).unwrap();
@@ -311,7 +345,33 @@ mod test {
         db.save_descriptor(desc).unwrap();
         assert_eq!(db.get_descriptors().unwrap(), vec![desc]);
 
-        db.update(&cache_address);
+        db.update(&cache_address).unwrap();
         assert_eq!(db.load().unwrap()[0].script_hash, cache_address.script_hash);
+    }
+
+    /// A stored key that is not a 32-byte txid must surface as
+    /// [`KvDatabaseError::InvalidTxid`], and the underlying `FromSliceError` must be kept
+    /// as the error's source rather than discarded.
+    #[test]
+    fn propagates_invalid_txid_with_source() {
+        let short_key = [0_u8; 5];
+        let slice_err = Txid::from_slice(&short_key).unwrap_err();
+
+        let err = KvDatabaseError::from(slice_err);
+
+        assert!(matches!(err, KvDatabaseError::InvalidTxid(_)));
+        assert!(err.source().is_some());
+    }
+
+    /// A serde failure reaching the database boundary is wrapped, not flattened into a
+    /// stringly-typed variant, so the source chain survives.
+    #[test]
+    fn propagates_serde_json_with_source() {
+        let serde_err = serde_json::from_slice::<CachedAddress>(b"not json").unwrap_err();
+
+        let err = KvDatabaseError::from(serde_err);
+
+        assert!(matches!(err, KvDatabaseError::SerdeJsonError(_)));
+        assert!(err.source().is_some());
     }
 }

@@ -158,6 +158,12 @@ impl Socks5StreamBuilder {
             SOCKS_ADDR_TYPE_DOMAIN => {
                 let mut buf = [0_u8; 1];
                 socket.read_exact(&mut buf).await?;
+                #[allow(
+                    clippy::indexing_slicing,
+                    clippy::arithmetic_side_effects,
+                    reason = "`buf` has exactly one element, read above, and widening a u8 to usize \
+                              before adding 2 cannot overflow"
+                )]
                 let mut buf = vec![0_u8; buf[0] as usize + 2];
                 socket.read_exact(&mut buf).await?;
             }

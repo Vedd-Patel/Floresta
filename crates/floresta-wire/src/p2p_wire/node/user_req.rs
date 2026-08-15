@@ -21,6 +21,57 @@ use crate::node_handle::NodeResponse;
 use crate::node_handle::UserRequest;
 use crate::p2p_wire::error::WireError;
 
+/// Errors that originate while serving a user request.
+///
+/// These are failures of the request/response plumbing itself, distinct from anything the
+/// node encountered while producing the answer.
+#[derive(Debug)]
+pub enum UserReqError {
+    /// The caller stopped waiting before the answer was ready.
+    ///
+    /// Not a fault: a client that times out or disconnects produces this, and the node
+    /// simply drops the answer. It is surfaced so callers can distinguish it from a real
+    /// failure to compute the response.
+    CallerGone,
+}
+
+impl std::fmt::Display for UserReqError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CallerGone => {
+                write!(
+                    f,
+                    "the caller stopped waiting before the response was ready"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for UserReqError {
+    /// [`oneshot::Sender::send`] hands the unsent value back rather than an error, so there
+    /// is no underlying failure to expose.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+/// Delivers a response to a waiting user request.
+///
+/// # Errors
+///
+/// Returns [`UserReqError::CallerGone`] if the receiving half has already been dropped.
+pub(crate) fn answer_user_request(
+    sender: oneshot::Sender<NodeResponse>,
+    response: NodeResponse,
+) -> Result<(), WireError> {
+    if sender.send(response).is_err() {
+        return Err(UserReqError::CallerGone.into());
+    }
+
+    Ok(())
+}
+
 impl<T, Chain> UtreexoNode<Chain, T>
 where
     T: 'static + Default + NodeContext,
@@ -227,14 +278,65 @@ where
             .remove(&UserRequest::Block(block.block_hash()))
         {
             debug!("answering user request for block {}", block.block_hash());
-            request
-                .2
-                .send(NodeResponse::Block(Some(block)))
-                .map_err(|_| WireError::ResponseSendError)?;
+            answer_user_request(request.2, NodeResponse::Block(Some(block)))?;
 
             return Ok(None);
         }
 
         Ok(Some(block))
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
+mod tests {
+    use tokio::sync::oneshot;
+
+    use super::UserReqError;
+    use super::answer_user_request;
+    use crate::node_handle::NodeResponse;
+    use crate::p2p_wire::error::WireError;
+
+    /// A caller still waiting receives the answer, and the send reports success.
+    #[test]
+    fn delivers_response_to_a_waiting_caller() {
+        let (tx, rx) = oneshot::channel();
+
+        answer_user_request(tx, NodeResponse::Block(None)).unwrap();
+
+        assert!(matches!(rx.blocking_recv(), Ok(NodeResponse::Block(None))));
+    }
+
+    /// If the caller gave up and dropped the receiver, the send fails and must surface as
+    /// [`UserReqError::CallerGone`] rather than panicking or being ignored.
+    #[test]
+    fn propagates_response_send_error_when_caller_is_gone() {
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+
+        let err = answer_user_request(tx, NodeResponse::Block(None)).unwrap_err();
+
+        assert!(matches!(err, WireError::UserReq(UserReqError::CallerGone)));
+    }
+
+    /// The same contract holds for mempool transaction answers.
+    #[test]
+    fn propagates_response_send_error_for_mempool_answers() {
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+
+        let err = answer_user_request(tx, NodeResponse::MempoolTransaction(None)).unwrap_err();
+
+        assert!(matches!(err, WireError::UserReq(UserReqError::CallerGone)));
     }
 }

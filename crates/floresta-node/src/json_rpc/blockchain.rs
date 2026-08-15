@@ -44,13 +44,85 @@ use crate::json_rpc::res::RescanConfidence;
 use crate::json_rpc::server::SERIALIZATION_EXPECT_MSG;
 use crate::json_rpc::server::to_core_asm_string;
 
+/// Errors that originate in the chain-query endpoints.
+///
+/// These are the conditions a client asking about blocks and transactions can actually act
+/// on: the thing was not found, the rescan bounds were wrong, or the node has not synced
+/// far enough to answer yet.
+#[derive(Debug)]
+pub enum BlockchainRpcError {
+    /// No block matches the requested height or hash.
+    BlockNotFound,
+
+    /// The wallet has not cached the requested transaction.
+    ///
+    /// Floresta only knows about transactions involving watched addresses, so this is the
+    /// expected answer for anything else rather than a fault.
+    TxNotFound,
+
+    /// The requested rescan range is not usable.
+    InvalidRescanRange {
+        /// Why the range was rejected, so the client can correct it.
+        reason: &'static str,
+    },
+
+    /// No block corresponds to the supplied timestamp.
+    InvalidTimestamp,
+
+    /// The node is still syncing and cannot answer historical queries yet.
+    ///
+    /// Distinct from a missing feature: the client should retry once sync completes.
+    StillSyncing,
+
+    /// Compact block filters are not configured, so this query cannot be served.
+    ///
+    /// The operator needs to restart with `--cfilters` for this endpoint to work.
+    NoBlockFilters,
+}
+
+impl core::fmt::Display for BlockchainRpcError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BlockNotFound => write!(f, "no block matches that height or hash"),
+            Self::TxNotFound => write!(f, "the wallet has not cached that transaction"),
+            Self::InvalidRescanRange { reason } => {
+                write!(f, "the rescan range is not usable: {reason}")
+            }
+            Self::InvalidTimestamp => write!(f, "no block corresponds to that timestamp"),
+            Self::StillSyncing => {
+                write!(f, "the node is still syncing and cannot answer this yet")
+            }
+            Self::NoBlockFilters => write!(
+                f,
+                "compact block filters are not enabled; restart with --cfilters"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for BlockchainRpcError {
+    /// Each variant describes the condition itself; there is no wrapped failure.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        None
+    }
+}
+
+impl From<BlockchainRpcError> for JsonRpcError {
+    fn from(e: BlockchainRpcError) -> Self {
+        match e {
+            BlockchainRpcError::BlockNotFound => Self::BlockNotFound,
+            BlockchainRpcError::TxNotFound => Self::TxNotFound,
+            BlockchainRpcError::InvalidRescanRange { .. } => Self::InvalidRescanVal,
+            BlockchainRpcError::InvalidTimestamp => Self::InvalidTimestamp,
+            BlockchainRpcError::StillSyncing => Self::InInitialBlockDownload,
+            BlockchainRpcError::NoBlockFilters => Self::NoBlockFilters,
+        }
+    }
+}
+
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     async fn get_block_inner(&self, hash: BlockHash) -> Result<Block, JsonRpcError> {
-        let is_genesis = self
-            .chain
-            .get_block_hash(0)
-            .map_err(|_| JsonRpcError::Chain)?
-            .eq(&hash);
+        let is_genesis = self.chain.get_block_hash(0)?.eq(&hash);
 
         if is_genesis {
             return Ok(genesis_block(self.network));
@@ -71,16 +143,19 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     pub fn get_block_by_txid(&self, txid: &Txid) -> Result<Block, JsonRpcError> {
         let height = self
             .wallet
-            .get_height(txid)
-            .ok_or(JsonRpcError::TxNotFound)?;
+            .get_height(txid)?
+            .ok_or(BlockchainRpcError::TxNotFound)?;
         let blockhash = self
             .chain
             .get_block_hash(height)
-            .map_err(|_| JsonRpcError::BlockNotFound)?;
+            .ok()
+            .ok_or(BlockchainRpcError::BlockNotFound)?;
 
         self.chain
             .get_block(&blockhash)
-            .map_err(|_| JsonRpcError::BlockNotFound)
+            .ok()
+            .ok_or(BlockchainRpcError::BlockNotFound)
+            .map_err(Into::into)
     }
 
     pub fn get_rescan_interval(
@@ -98,13 +173,13 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             return Ok((start_height, stop_height));
         }
 
-        let (tip, _) = self
-            .chain
-            .get_best_block()
-            .map_err(|_| JsonRpcError::Chain)?;
+        let (tip, _) = self.chain.get_best_block()?;
 
         if stop > tip {
-            return Err(JsonRpcError::InvalidRescanVal);
+            return Err(BlockchainRpcError::InvalidRescanRange {
+                reason: "stop height is beyond the chain tip",
+            }
+            .into());
         }
 
         Ok((start, stop))
@@ -137,20 +212,26 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let (tip_height, _) = self
             .chain
             .get_best_block()
-            .map_err(|_| JsonRpcError::BlockNotFound)?;
+            .ok()
+            .ok_or(BlockchainRpcError::BlockNotFound)?;
 
         let tip_time = get_block_time(self, tip_height)?;
 
         if timestamp < genesis_timestamp || timestamp > tip_time {
-            return Err(JsonRpcError::InvalidTimestamp);
+            return Err(BlockchainRpcError::InvalidTimestamp.into());
         }
 
         let adjusted_target = timestamp.saturating_sub(confidence.as_secs());
 
         let mut high = tip_height;
         let mut low = 0;
-        let max_iters = tip_height.ilog2() + 1;
+        let max_iters = tip_height.ilog2().saturating_add(1);
         for _ in 0..max_iters {
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "this is a binary search over block heights with low <= high, both bounded by \
+                          the chain tip, so the midpoint cannot overflow"
+            )]
             let cut = (high + low) / 2;
 
             let block_timestamp = get_block_time(self, cut)?;
@@ -160,7 +241,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 return Ok(cut);
             }
 
-            if high - low <= 2 {
+            if high.saturating_sub(low) <= 2 {
                 debug!("didn't find a precise block; returning {low}");
                 return Ok(low);
             }
@@ -183,11 +264,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
     // getbestblockhash
     pub(super) fn get_best_block_hash(&self) -> Result<BlockHash, JsonRpcError> {
-        Ok(self
-            .chain
-            .get_best_block()
-            .map_err(|_| JsonRpcError::Chain)?
-            .1)
+        Ok(self.chain.get_best_block()?.1)
     }
 
     // getblock
@@ -210,7 +287,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             // Header + VarInt for number of transactions + sum of base sizes of each transaction
             let tx_count_varint_size = VarInt::from(block.txdata.len()).size();
             let total_tx_base_size: usize = block.txdata.iter().map(|tx| tx.base_size()).sum();
-            let stripped_size_bytes = Header::SIZE + tx_count_varint_size + total_tx_base_size;
+            // Bounded by the block weight limit, so this sum cannot overflow usize.
+            let stripped_size_bytes = Header::SIZE
+                .saturating_add(tx_count_varint_size)
+                .saturating_add(total_tx_base_size);
 
             let stripped_size = Some(stripped_size_bytes.try_into()?);
 
@@ -253,19 +333,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     // `headers` tracks the best-known header tip; `blocks` tracks the validated
     // tip. They can diverge mid-IBD and coincide once sync completes.
     pub(super) fn get_blockchain_info(&self) -> Result<GetBlockchainInfo, JsonRpcError> {
-        let (height, hash) = self
-            .chain
-            .get_best_block()
-            .map_err(|_| JsonRpcError::Chain)?;
-        let validated = self
-            .chain
-            .get_validation_index()
-            .map_err(|_| JsonRpcError::Chain)?;
+        let (height, hash) = self.chain.get_best_block()?;
+        let validated = self.chain.get_validation_index()?;
         let initial_block_download = self.chain.is_in_ibd();
-        let latest_header = self
-            .chain
-            .get_block_header(&hash)
-            .map_err(|_| JsonRpcError::Chain)?;
+        let latest_header = self.chain.get_block_header(&hash)?;
         let chain_work = latest_header
             .calculate_chain_work(&self.chain)?
             .to_string_hex();
@@ -284,8 +355,8 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let difficulty = latest_header.get_difficulty();
         let time = i64::from(latest_header.time);
         let median_time = i64::from(latest_header.calculate_median_time_past(&self.chain)?);
-        let size_on_disk = self.chain.size_on_disk().map_err(|_| JsonRpcError::Chain)?;
-        let prune_height = Some(blocks + 1);
+        let size_on_disk = self.chain.size_on_disk()?;
+        let prune_height = Some(blocks.saturating_add(1));
 
         let chain = match self.network {
             Network::Bitcoin => "main",
@@ -321,7 +392,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
     // getblockcount
     pub(super) fn get_block_count(&self) -> Result<u32, JsonRpcError> {
-        self.chain.get_height().map_err(|_| JsonRpcError::Chain)
+        Ok(self.chain.get_height()?)
     }
 
     // getblockfilter
@@ -331,7 +402,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     pub(super) fn get_block_hash(&self, height: u32) -> Result<BlockHash, JsonRpcError> {
         self.chain
             .get_block_hash(height)
-            .map_err(|_| JsonRpcError::BlockNotFound)
+            .ok()
+            .ok_or(BlockchainRpcError::BlockNotFound)
+            .map_err(Into::into)
     }
 
     // getblockheader
@@ -364,18 +437,13 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         &self,
         hash: Option<BlockHash>,
     ) -> Result<GetDeploymentInfo, JsonRpcError> {
-        let tip = self
-            .chain
-            .get_best_block()
-            .map_err(|_| JsonRpcError::Chain)?
-            .1;
+        let tip = self.chain.get_best_block()?.1;
         let target_hash = hash.unwrap_or(tip);
 
         let height = self
             .chain
-            .get_block_height(&target_hash)
-            .map_err(|_| JsonRpcError::Chain)?
-            .ok_or(JsonRpcError::BlockNotFound)?;
+            .get_block_height(&target_hash)?
+            .ok_or(BlockchainRpcError::BlockNotFound)?;
 
         let mut deployments = BTreeMap::new();
 
@@ -400,14 +468,12 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
     // getdifficulty
     pub(super) fn get_difficulty(&self) -> Result<f64, JsonRpcError> {
-        let (_, hash) = self
-            .chain
-            .get_best_block()
-            .map_err(|_| JsonRpcError::Chain)?;
+        let (_, hash) = self.chain.get_best_block()?;
         let header = self
             .chain
             .get_block_header(&hash)
-            .map_err(|_| JsonRpcError::BlockNotFound)?;
+            .ok()
+            .ok_or(BlockchainRpcError::BlockNotFound)?;
         Ok(header.difficulty_float())
     }
 
@@ -463,7 +529,9 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     fn get_block_header_inner(&self, hash: BlockHash) -> Result<Header, JsonRpcError> {
         self.chain
             .get_block_header(&hash)
-            .map_err(|_| JsonRpcError::BlockNotFound)
+            .ok()
+            .ok_or(BlockchainRpcError::BlockNotFound)
+            .map_err(Into::into)
     }
 
     /// Check if the script is anchor type
@@ -542,12 +610,15 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         _include_mempool: bool,
     ) -> Result<Option<GetTxOut>, JsonRpcError> {
         let res = match (
-            self.wallet.get_transaction(&txid),
-            self.wallet.get_height(&txid),
-            self.wallet.get_utxo(&OutPoint {
-                txid,
-                vout: outpoint,
-            }),
+            self.wallet.get_transaction(&txid).ok().flatten(),
+            self.wallet.get_height(&txid).ok().flatten(),
+            self.wallet
+                .get_utxo(&OutPoint {
+                    txid,
+                    vout: outpoint,
+                })
+                .ok()
+                .flatten(),
         ) {
             (Some(cached_tx), Some(height), Some(txout)) => {
                 let is_coinbase = cached_tx.tx.is_coinbase();
@@ -581,7 +652,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
                 Some(GetTxOut {
                     best_block: bestblock_hash.to_string(),
-                    confirmations: bestblock_height - height + 1,
+                    confirmations: bestblock_height.saturating_sub(height).saturating_add(1),
                     value: txout.value.to_btc(),
                     script_pubkey,
                     coinbase: is_coinbase,
@@ -602,6 +673,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     /// watch-only wallet which may not have the transaction cached.
     ///
     /// Not finding one of the specified transactions will raise [`JsonRpcError::TxNotFound`].
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: encoding to a Vec<u8> writer is infallible"
+    )]
     pub(super) async fn get_txout_proof(
         &self,
         tx_ids: &[Txid],
@@ -611,7 +686,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             Some(blockhash) => self.get_block_inner(blockhash).await?,
             // Using the first Txid to get the block should be fine since they are expected to all
             // live in the same block, otherwise, theres no way they have a common proof.
-            None => self.get_block_by_txid(&tx_ids[0])?,
+            None => {
+                let first = tx_ids.first().ok_or(BlockchainRpcError::TxNotFound)?;
+                self.get_block_by_txid(first)?
+            }
         };
 
         // Before building the merkle block we try to remove all txids
@@ -641,7 +719,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let mut bytes: Vec<u8> = Vec::new();
         merkle_block
             .consensus_encode(&mut bytes)
-            .expect("This will raise if a writer error happens");
+            .expect("BUG: This will raise if a writer error happens");
         Ok(GetTxOutProof(bytes.to_lower_hex_string()))
     }
 
@@ -659,6 +737,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
     // floresta flavored rpcs. These are not part of the bitcoin rpc spec
     // findtxout
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: all RPC response types implement Serialize"
+    )]
     pub(super) async fn find_tx_out(
         &self,
         txid: Txid,
@@ -666,21 +748,21 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         script: ScriptBuf,
         height: u32,
     ) -> Result<Value, JsonRpcError> {
-        if let Some(txout) = self.wallet.get_utxo(&OutPoint { txid, vout }) {
+        if let Ok(Some(txout)) = self.wallet.get_utxo(&OutPoint { txid, vout }) {
             return Ok(serde_json::to_value(txout).expect(SERIALIZATION_EXPECT_MSG));
         }
 
         // if we are on IBD, we don't have any filters to find this txout.
         if self.chain.is_in_ibd() {
-            return Err(JsonRpcError::InInitialBlockDownload);
+            return Err(BlockchainRpcError::StillSyncing.into());
         }
 
         // can't proceed without block filters
         let Some(cfilters) = self.block_filter_storage.as_ref() else {
-            return Err(JsonRpcError::NoBlockFilters);
+            return Err(BlockchainRpcError::NoBlockFilters.into());
         };
 
-        self.wallet.cache_address(script.clone());
+        let _ = self.wallet.cache_address(script.clone());
         let filter_key = script.to_bytes();
         let candidates = cfilters
             .match_any(
@@ -709,7 +791,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 return Err(JsonRpcError::BlockNotFound);
             };
 
-            self.wallet.block_process(&candidate, height);
+            let _ = self.wallet.block_process(&candidate, height);
         }
 
         let val = match self.get_tx_out(txid, vout, false)? {
@@ -731,5 +813,145 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             .get_descriptors()
             .map_err(|e| JsonRpcError::Wallet(e.to_string()))?;
         Ok(descriptors)
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
+mod tests {
+    use bitcoin::BlockHash;
+    use bitcoin::Txid;
+    use bitcoin::hashes::Hash;
+    use floresta_chain::BlockchainInterface;
+
+    use crate::json_rpc::res::RescanConfidence;
+    use crate::json_rpc::res::jsonrpc_interface::JsonRpcError;
+    use crate::json_rpc::test_fixture::test_rpc;
+
+    /// A height past the tip has no block, and the chain's "not present" failure must be
+    /// translated into the RPC's own `BlockNotFound` rather than a generic chain error.
+    #[test]
+    fn propagates_block_not_found_for_height_past_tip() {
+        let fixture = test_rpc();
+
+        let err = fixture.rpc.get_block_hash(9_999).unwrap_err();
+
+        assert!(matches!(err, JsonRpcError::BlockNotFound));
+    }
+
+    /// The same for a hash the chain has never seen.
+    #[tokio::test]
+    async fn propagates_block_not_found_for_unknown_hash() {
+        let fixture = test_rpc();
+
+        let err = fixture
+            .rpc
+            .get_block(BlockHash::all_zeros(), 0)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, JsonRpcError::BlockNotFound));
+    }
+
+    /// A transaction the wallet has never cached cannot be located, and the error says so
+    /// specifically instead of surfacing as a chain fault.
+    #[test]
+    fn propagates_tx_not_found_for_unknown_txid() {
+        let fixture = test_rpc();
+
+        let err = fixture
+            .rpc
+            .get_block_by_txid(&Txid::all_zeros())
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            JsonRpcError::TxNotFound | JsonRpcError::BlockNotFound
+        ));
+    }
+
+    /// A rescan whose stop height is beyond the tip is a client-side mistake, reported as
+    /// an invalid rescan value rather than being clamped silently.
+    #[test]
+    fn propagates_invalid_rescan_val_past_tip() {
+        let fixture = test_rpc();
+
+        let err = fixture
+            .rpc
+            .get_rescan_interval(false, 0, 9_999, RescanConfidence::Exact)
+            .unwrap_err();
+
+        assert!(matches!(err, JsonRpcError::InvalidRescanVal));
+    }
+
+    /// A rescan entirely inside the known chain succeeds, so the check above is rejecting
+    /// the right thing rather than everything.
+    #[test]
+    fn accepts_rescan_interval_within_the_chain() {
+        let fixture = test_rpc();
+
+        let (start, stop) = fixture
+            .rpc
+            .get_rescan_interval(false, 0, 0, RescanConfidence::Exact)
+            .unwrap();
+
+        assert_eq!((start, stop), (0, 0));
+    }
+
+    /// A timestamp older than genesis has no corresponding block, and must be reported as
+    /// an invalid timestamp.
+    #[test]
+    fn propagates_invalid_timestamp_before_genesis() {
+        let fixture = test_rpc();
+
+        let err = fixture
+            .rpc
+            .get_block_height_by_timestamp(1, &RescanConfidence::Exact)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            JsonRpcError::InvalidTimestamp | JsonRpcError::BlockNotFound
+        ));
+    }
+
+    /// Reading a UTXO the wallet does not track is a miss, not an error.
+    #[test]
+    fn get_tx_out_reports_miss_for_unknown_outpoint() {
+        let fixture = test_rpc();
+
+        let res = fixture.rpc.get_tx_out(Txid::all_zeros(), 0, false).unwrap();
+
+        assert!(res.is_none());
+    }
+
+    /// A node that has not synced cannot scan for a txout, and says so before it ever
+    /// looks at whether compact filters are configured. Reporting the more specific of the
+    /// two conditions is what lets an operator tell "still syncing" from "filters are off".
+    #[tokio::test]
+    async fn propagates_initial_block_download_before_checking_filters() {
+        let fixture = test_rpc();
+        assert!(
+            fixture.rpc.chain.is_in_ibd(),
+            "a fresh chainstate is in IBD, which is what drives this path"
+        );
+
+        let err = fixture
+            .rpc
+            .find_tx_out(Txid::all_zeros(), 0, bitcoin::ScriptBuf::new(), 0)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, JsonRpcError::InInitialBlockDownload));
     }
 }

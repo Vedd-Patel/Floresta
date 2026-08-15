@@ -38,6 +38,7 @@ use crate::address_man::AddressMan;
 use crate::address_man::AddressState;
 use crate::address_man::LocalAddress;
 use crate::bitcoin_socket_addr::BitcoinSocketAddr;
+use crate::node::peer_man::PeerManError;
 use crate::node_context::NodeContext;
 use crate::p2p_wire::error::WireError;
 use crate::p2p_wire::peer::Peer;
@@ -117,9 +118,10 @@ where
 
         debug!("Attempting connection with address={peer_address:?} kind={conn_kind:?}",);
 
+        #[allow(clippy::expect_used, reason = "invariant above")]
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system time is after 1970")
             .as_secs();
 
         // Defaults to failed, if the connection is successful, we'll update the state
@@ -133,7 +135,7 @@ where
             .values()
             .any(|p| p.address == peer_address)
         {
-            return Err(WireError::PeerAlreadyExists(peer_address));
+            return Err(PeerManError::PeerAlreadyExists(peer_address).into());
         }
 
         // Only allow P2PV1 fallback if the peer's connection kind is manual,
@@ -191,10 +193,17 @@ where
                     requests_rx,
                     self.peer_id_count,
                     self.config.user_agent.clone(),
-                    self.chain
-                        .get_best_block()
-                        .expect("infallible in ChainState")
-                        .0,
+                    {
+                        #[allow(
+                            clippy::expect_used,
+                            reason = "reading the best block from an initialised ChainState \
+                                      cannot fail; the node does not start without one"
+                        )]
+                        self.chain
+                            .get_best_block()
+                            .expect("infallible in ChainState")
+                            .0
+                    },
                     allow_v1_fallback,
                 ),
             ));
@@ -210,10 +219,17 @@ where
                     self.network,
                     self.node_tx.clone(),
                     self.config.user_agent.clone(),
-                    self.chain
-                        .get_best_block()
-                        .expect("infallible in ChainState")
-                        .0,
+                    {
+                        #[allow(
+                            clippy::expect_used,
+                            reason = "reading the best block from an initialised ChainState cannot fail; \
+                                      the node does not start without one"
+                        )]
+                        self.chain
+                            .get_best_block()
+                            .expect("infallible in ChainState")
+                            .0
+                    },
                     allow_v1_fallback,
                 ),
             ));
@@ -254,13 +270,13 @@ where
             //
             // Extra connections are also not taken into account here because they will probably be
             // short-lived.
-            _ => {}
+            ConnectionKind::Extra | ConnectionKind::Manual => {}
         }
 
         // Increment peer_id count and the list of peer ids
         // so we can get information about connected or
         // added peers when requesting with getpeerinfo command
-        self.peer_id_count += 1;
+        self.peer_id_count = self.peer_id_count.saturating_add(1);
         Ok(())
     }
 
@@ -389,9 +405,14 @@ where
                 addresses.len()
             );
 
-            node_sender
+            // The receiver lives for the node's lifetime; if it is gone the node is shutting
+            // down and there is nothing useful to do with these addresses.
+            if node_sender
                 .send(NodeNotification::DnsSeedAddresses(addresses))
-                .unwrap();
+                .is_err()
+            {
+                debug!("could not report DNS seed addresses: node is shutting down");
+            }
         });
 
         Ok(())
@@ -556,8 +577,14 @@ where
         // Sort by latency, then get the median time and the slowest peer
         samples.sort_by(|a, b| a.1.total_cmp(&b.1));
 
-        let (_, median_latency) = samples[samples.len() / 2];
-        let (slowest_peer_id, slowest_latency) = samples[samples.len() - 1];
+        #[allow(
+            clippy::indexing_slicing,
+            clippy::arithmetic_side_effects,
+            reason = "callers only reach this after checking `samples` is non-empty, so the median \
+                      index is in bounds and `len() - 1` cannot underflow"
+        )]
+        let ((_, median_latency), (slowest_peer_id, slowest_latency)) =
+            (samples[samples.len() / 2], samples[samples.len() - 1]);
 
         let should_disconnect = always
             || slowest_latency > ALLOWED_DEVIATION * median_latency
@@ -586,12 +613,13 @@ where
                 let address = LocalAddress::new(
                     added_peer.address.clone(),
                     0,
-                    AddressState::Tried(
+                    AddressState::Tried({
+                        #[allow(clippy::expect_used, reason = "the system clock is after 1970")]
                         SystemTime::now()
                             .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                    ),
+                            .expect("system time is after 1970")
+                            .as_secs()
+                    }),
                     ServiceFlags::NONE,
                     peers_count as usize,
                 );

@@ -113,6 +113,10 @@ pub mod jsonrpc_interface {
         pub data: Option<Value>,
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: RpcError implements Serialize, so to_string cannot fail"
+    )]
     impl Display for RpcError {
         fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
             write!(
@@ -197,7 +201,11 @@ pub mod jsonrpc_interface {
         BlockNotFound,
 
         /// Chain-level error (e.g. chain not synced or invalid).
-        Chain,
+        ///
+        /// Carries the backend's own message. The chain backend is generic over its error
+        /// type, so it cannot be wrapped structurally here; the diagnostic string follows
+        /// the same convention as `ChainstoreError::Other`.
+        Chain(String),
 
         /// The JSON-RPC request itself is malformed.
         InvalidRequest,
@@ -258,6 +266,60 @@ pub mod jsonrpc_interface {
     impl_error_from!(JsonRpcError, MempoolError, MempoolAccept);
     impl_error_from!(JsonRpcError, InvalidAddressError, InvalidNetAddress);
 
+    impl Display for JsonRpcError {
+        /// Renders the same message the JSON-RPC layer would send to a client, so logs and
+        /// wire responses agree. Variants that carry a diagnostic payload append it.
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let rpc = self.rpc_error();
+
+            match rpc.data {
+                Some(Value::String(detail)) => write!(f, "{}: {detail}", rpc.message),
+                Some(data) => write!(f, "{}: {data}", rpc.message),
+                None => write!(f, "{}", rpc.message),
+            }
+        }
+    }
+
+    impl std::error::Error for JsonRpcError {
+        /// Exposes the wrapped failure where one exists. Most variants carry a diagnostic
+        /// string rather than a typed error: the chain backend is generic over its error
+        /// type, so [`Chain`](JsonRpcError::Chain) keeps the backend's message instead.
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::InvalidDescriptor(e) => Some(e),
+                Self::InvalidNetAddress(e) => Some(e),
+                Self::NoAddressesToRescan
+                | Self::InvalidRescanVal
+                | Self::MissingParameter(_)
+                | Self::InvalidParameterType(_)
+                | Self::InvalidParameterStructure(_)
+                | Self::InvalidJsonRpcVersion
+                | Self::InvalidVerbosityLevel
+                | Self::TxNotFound
+                | Self::InvalidScript
+                | Self::BlockNotFound
+                | Self::Chain(_)
+                | Self::InvalidRequest
+                | Self::MethodNotFound
+                | Self::Decode(_)
+                | Self::Node(_)
+                | Self::NoBlockFilters
+                | Self::InvalidHex
+                | Self::InInitialBlockDownload
+                | Self::InvalidMemInfoMode
+                | Self::Wallet(_)
+                | Self::Filters(_)
+                | Self::ChainWorkOverflow
+                | Self::InvalidAddnodeCommand
+                | Self::InvalidDisconnectNodeCommand
+                | Self::PeerNotFound
+                | Self::InvalidTimestamp
+                | Self::MempoolAccept(_)
+                | Self::ConversionOverflow(_) => None,
+            }
+        }
+    }
+
     impl JsonRpcError {
         pub fn http_code(&self) -> StatusCode {
             match self {
@@ -297,7 +359,7 @@ pub mod jsonrpc_interface {
                 Self::InInitialBlockDownload
                 | Self::NoBlockFilters
                 | Self::Node(_)
-                | Self::Chain
+                | Self::Chain(_)
                 | Self::Filters(_) => StatusCode::SERVICE_UNAVAILABLE,
             }
         }
@@ -457,10 +519,10 @@ pub mod jsonrpc_interface {
                     message: "Node error".into(),
                     data: Some(Value::String(msg.clone())),
                 },
-                Self::Chain => RpcError {
+                Self::Chain(msg) => RpcError {
                     code: CHAIN_ERROR,
                     message: "Chain error".into(),
-                    data: None,
+                    data: Some(Value::String(msg.clone())),
                 },
                 Self::Filters(msg) => RpcError {
                     code: FILTERS_ERROR,
@@ -474,7 +536,7 @@ pub mod jsonrpc_interface {
     impl From<HeaderExtError> for JsonRpcError {
         fn from(value: HeaderExtError) -> Self {
             match value {
-                HeaderExtError::Chain(_) => Self::Chain,
+                HeaderExtError::Chain(e) => Self::Chain(e.to_string()),
                 HeaderExtError::BlockNotFound => Self::BlockNotFound,
                 HeaderExtError::ChainWorkOverflow => Self::ChainWorkOverflow,
             }
@@ -504,7 +566,78 @@ pub mod jsonrpc_interface {
         fn from(e: BlockchainError) -> Self {
             match e {
                 BlockchainError::BlockNotPresent => Self::BlockNotFound,
-                _ => Self::Chain,
+                // Every other chain failure is reported to the client as a generic chain
+                // error carrying the backend's message; enumerated so a newly added
+                // BlockchainError variant is reviewed here rather than silently lumped in.
+                other @ (BlockchainError::OrphanOrInvalidBlock
+                | BlockchainError::BlockValidation(_)
+                | BlockchainError::TransactionError(_)
+                | BlockchainError::InvalidUtreexoProof
+                | BlockchainError::AccumulatorError(_)
+                | BlockchainError::UtreexoLeaf(_)
+                | BlockchainError::Database(_)
+                | BlockchainError::ChainNotInitialized
+                | BlockchainError::InvalidTip(_)
+                | BlockchainError::BadValidationIndex
+                | BlockchainError::OperationOverflow(_)
+                | BlockchainError::Unsupported(_)) => Self::Chain(other.to_string()),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::wildcard_enum_match_arm,
+        reason = "test code: a panic is the assertion failing, which is the intent"
+    )]
+    mod tests {
+        use floresta_chain::BlockchainError;
+
+        use super::JsonRpcError;
+
+        /// A missing block is the one chain failure the RPC layer can describe precisely, so
+        /// it keeps its own variant instead of collapsing into the generic chain error.
+        #[test]
+        fn propagates_block_not_found_from_chain() {
+            let err = JsonRpcError::from(BlockchainError::BlockNotPresent);
+
+            assert!(matches!(err, JsonRpcError::BlockNotFound));
+        }
+
+        /// Every other chain failure becomes `Chain`, carrying the backend's own message so
+        /// the diagnostic reaches the client instead of being discarded.
+        #[test]
+        fn propagates_chain_error_with_backend_message() {
+            let backend = BlockchainError::ChainNotInitialized;
+            let expected = backend.to_string();
+
+            let err = JsonRpcError::from(backend);
+
+            match err {
+                JsonRpcError::Chain(message) => {
+                    assert!(!message.is_empty());
+                    assert_eq!(message, expected, "the backend message must survive");
+                }
+                other => panic!("expected Chain, got {other:?}"),
+            }
+        }
+
+        /// The same holds for an unsupported operation, which previously would have been
+        /// flattened into a message-less variant.
+        #[test]
+        fn propagates_unsupported_as_chain_error() {
+            let err = JsonRpcError::from(BlockchainError::Unsupported("get_tx"));
+
+            match err {
+                JsonRpcError::Chain(message) => assert!(message.contains("get_tx")),
+                other => panic!("expected Chain, got {other:?}"),
             }
         }
     }

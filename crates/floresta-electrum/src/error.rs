@@ -20,6 +20,8 @@ pub enum Error {
     Mempool(Box<dyn error::Error + Send + 'static>),
     /// The node is unresponsive.
     NodeHandle(oneshot::error::RecvError),
+    /// A Wallet (watch-only) error has occurred.
+    Wallet(floresta_watch_only::WatchOnlyError<floresta_watch_only::kv_database::KvDatabaseError>),
 }
 
 impl fmt::Display for Error {
@@ -31,7 +33,15 @@ impl fmt::Display for Error {
             Self::Io(e) => write!(f, "IO error: {e}"),
             Self::Mempool(e) => writeln!(f, "Mempool error: {e}"),
             Self::NodeHandle(e) => write!(f, "The node is unresponsive: {e}"),
+            Self::Wallet(e) => write!(f, "Wallet error: {e}"),
         }
+    }
+}
+
+impl From<floresta_chain::BlockchainError> for Error {
+    /// The canonical wrapping for a chain failure reaching the Electrum layer.
+    fn from(e: floresta_chain::BlockchainError) -> Self {
+        Self::Blockchain(Box::new(e))
     }
 }
 
@@ -44,6 +54,7 @@ impl error::Error for Error {
             Self::Io(e) => Some(e),
             Self::Mempool(e) => Some(e.as_ref()),
             Self::NodeHandle(e) => Some(e),
+            Self::Wallet(e) => Some(e),
         }
     }
 }
@@ -51,3 +62,8 @@ impl error::Error for Error {
 impl_error_from!(Error, serde_json::Error, Parsing);
 impl_error_from!(Error, std::io::Error, Io);
 impl_error_from!(Error, oneshot::error::RecvError, NodeHandle);
+impl_error_from!(
+    Error,
+    floresta_watch_only::WatchOnlyError<floresta_watch_only::kv_database::KvDatabaseError>,
+    Wallet
+);

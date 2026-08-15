@@ -21,7 +21,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Create a new JSON-RPC client using the host from the CLI arguments
-    let client = Client::new(get_host(&cli));
+    let client = Client::new(get_host(&cli))?;
 
     // Perform the requested RPC call and get the result
     let res = do_request(&cli, client)?;

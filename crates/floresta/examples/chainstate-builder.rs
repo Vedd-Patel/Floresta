@@ -6,6 +6,13 @@
 //! block, or that doesn't validate all signatures. All customizations are done through the
 //! ChainStateBuilder struct. This example shows how to use it.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "example code: panicking on setup failure keeps the example readable"
+)]
 use bitcoin::Network;
 use bitcoin::blockdata::constants::genesis_block;
 use floresta_chain::AssumeValidArg;

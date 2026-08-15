@@ -129,6 +129,24 @@ pub enum TransportError {
     InvalidAddress,
 }
 
+impl std::error::Error for TransportError {
+    /// Exposes the underlying I/O, protocol or serialization failure. The size, checksum and
+    /// magic-bits variants describe the mismatch themselves through [`Display`].
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::SerdeV1(e) => Some(e),
+            Self::Protocol(_)
+            | Self::SerdeV2(_)
+            | Self::Proxy(_)
+            | Self::OversizedMessage { .. }
+            | Self::BadChecksum { .. }
+            | Self::BadMagicBits { .. }
+            | Self::InvalidAddress => None,
+        }
+    }
+}
+
 impl Display for TransportError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -213,6 +231,7 @@ impl Decodable for V1MessageHeader {
 }
 
 impl Encodable for V1MessageHeader {
+    #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
         writer: &mut W,
@@ -430,10 +449,19 @@ where
                     });
                 }
 
-                data.resize(24 + header.length as usize, 0);
-                reader.read_exact(&mut data[24..]).await?;
+                // The header length is bounded by the oversize check above, so widening it to
+                // usize and adding the 24-byte header cannot overflow.
+                data.resize((header.length as usize).saturating_add(24), 0);
 
-                let checksum = P2PV1MessageChecksum::from_payload(&data[24..]);
+                #[allow(
+                    clippy::indexing_slicing,
+                    reason = "data was just resized to at least 24 bytes, so both slices are \
+                              in bounds"
+                )]
+                let checksum = {
+                    reader.read_exact(&mut data[24..]).await?;
+                    P2PV1MessageChecksum::from_payload(&data[24..])
+                };
                 if header.checksum != checksum {
                     return Err(TransportError::BadChecksum {
                         expected: checksum,
@@ -461,7 +489,12 @@ where
             }
             Self::V1(writer, network) => {
                 if let NetworkMessage::Unknown { payload, command } = message {
-                    let expected_cmd = CommandString::try_from_static("getuproof").unwrap();
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "'getuproof' is a valid ASCII command string"
+                    )]
+                    let expected_cmd = CommandString::try_from_static("getuproof")
+                        .expect("`getuproof` is a valid command string");
                     assert_eq!(
                         command, expected_cmd,
                         "Only getuproof is supported as unknown message"
@@ -608,6 +641,17 @@ pub(crate) mod test_transport {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use std::io::ErrorKind;
 

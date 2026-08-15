@@ -51,9 +51,7 @@ pub trait NetworkMessageExt: Sized {
 }
 
 impl NetworkMessageExt for NetworkMessage {
-    /// Serialize a [`NetworkMessage`] into a V2-encoded buffer.
-    ///
-    /// Uses BIP-324 short message IDs for known message types.
+    #[allow(clippy::expect_used, reason = "invariant above")]
     fn serialize_v2(&self) -> Vec<u8> {
         let mut buffer = Vec::new();
 
@@ -63,9 +61,11 @@ impl NetworkMessageExt for NetworkMessage {
             /// P2PV2 BIP-0324 message type for `getuproof`.
             const P2PV2_GETUPROOF_MSG_TYPE: u8 = 30;
             // The legacy cmd string for get utreexo proof
-            let get_utreexo_proof_cmd_string: CommandString =
+            let get_utreexo_proof_cmd_string: CommandString = {
+                // INVARIANT: "getuproof" is a valid 12-byte-or-less ASCII command.
                 CommandString::try_from_static("getuproof")
-                    .expect("`getuproof` is a valid command string");
+                    .expect("`getuproof` is a valid command string")
+            };
 
             if *command == get_utreexo_proof_cmd_string {
                 buffer.push(P2PV2_GETUPROOF_MSG_TYPE);
@@ -145,8 +145,8 @@ impl NetworkMessageExt for NetworkMessage {
             )));
         }
 
-        let short_id = buffer[0];
-        let mut payload_buffer = &buffer[1..];
+        #[allow(clippy::indexing_slicing, reason = "invariant above")]
+        let (short_id, mut payload_buffer) = (buffer[0], &buffer[1..]);
 
         // TODO: remove this once https://github.com/rust-bitcoin/rust-bitcoin/pull/5671
         // and https://github.com/rust-bitcoin/rust-bitcoin/pull/5009 make it into a release
@@ -154,8 +154,14 @@ impl NetworkMessageExt for NetworkMessage {
         const P2PV2_UPROOF_MSG_TYPE: u8 = 29;
         if short_id == P2PV2_UPROOF_MSG_TYPE {
             let msg = Self::Unknown {
-                command: CommandString::try_from_static("uproof")
-                    .expect("`uproof` is a valid command string"),
+                command: {
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "'uproof' is a valid 12-byte-or-less ASCII command literal"
+                    )]
+                    CommandString::try_from_static("uproof")
+                        .expect("`uproof` is a valid command string")
+                },
                 payload: payload_buffer.to_vec(),
             };
 
@@ -176,6 +182,11 @@ impl NetworkMessageExt for NetworkMessage {
                     .iter()
                     .position(|byte| *byte == 0)
                     .unwrap_or(command_buffer.len());
+                #[allow(
+                    clippy::indexing_slicing,
+                    reason = "command_end comes from position/len on this same slice, so both halves are \
+                              in bounds"
+                )]
                 let command_is_valid = command_buffer[..command_end]
                     .iter()
                     .all(|byte| (0x20..=0x7e).contains(byte))
@@ -187,7 +198,7 @@ impl NetworkMessageExt for NetworkMessage {
                 }
                 let command = CommandString::consensus_decode(&mut command_buffer)
                     .map_err(V2MessageError::Deserialize)?;
-                payload_buffer = &buffer[13..];
+                payload_buffer = buffer.get(13..).unwrap_or_default();
                 match command.as_ref() {
                     "version" => Ok(Self::Version(Decodable::consensus_decode(
                         &mut payload_buffer,
@@ -301,6 +312,17 @@ impl NetworkMessageExt for NetworkMessage {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use bitcoin::p2p::message::CommandString;
     use bitcoin::p2p::message::NetworkMessage;

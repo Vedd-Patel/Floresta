@@ -18,5 +18,9 @@ bitcoin = { workspace = true }
 # Local dependencies
 floresta-chain = { workspace = true }
 
+[dev-dependencies]
+# Needed to name the accumulator types in the BlockchainInterface test double.
+rustreexo = { workspace = true }
+
 [lints]
 workspace = true

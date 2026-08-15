@@ -7,6 +7,16 @@
 //! It also defines two important types for our storage format:
 //! - [DiskBlockHeader]: A block header linked to its validation-state metadata
 //! - [BestChain]: Tracks the current best chain, last valid block, and fork tips
+//!
+//! # Error types
+//!
+//! This module centralises the error types used by chainstore implementations:
+//! - [ChainstoreError]: The public-facing error enum for [ChainStore] operations
+
+use core::error;
+use core::fmt;
+use core::fmt::Display;
+use core::fmt::Formatter;
 
 use bitcoin::BlockHash;
 use bitcoin::block::Header as BlockHeader;
@@ -17,6 +27,97 @@ use bitcoin::consensus::encode;
 use crate::BlockchainError;
 use crate::DatabaseError;
 use crate::prelude::*;
+
+/// The maximum theoretical size in bytes of the Utreexo accumulator
+///
+/// In the worst case that all leaves are filled:
+/// * The accumulator can have up to 64 roots
+/// * Each root is 32 bytes
+/// * The number of leaves is expressed as a [`u64`]
+///
+/// 64 (MAX_ROOTS) * 32 bytes (ROOT_SIZE) + 8 bytes (LEAF_COUNT) = 2056 bytes
+///
+/// Re-exported here so callers do not need to import from `flat_chain_store`
+pub const MAX_ACCUMULATOR_SIZE: usize = 2056;
+
+#[derive(Debug)]
+/// Errors that can happen whilst interacting with a [`ChainStore`] implementation
+///
+/// Variants that carry domain meaning ([`HeaderNotFound`], [`OversizedAccumulator`],
+/// [`CorruptedDatabase`], [`InvalidValidationIndex`]) allow callers to react
+/// programmatically. Unrecoverable implementation-level failures are wrapped inside
+/// [`Other`] as a plain diagnostic string.
+///
+/// [`HeaderNotFound`]: ChainstoreError::HeaderNotFound
+/// [`OversizedAccumulator`]: ChainstoreError::OversizedAccumulator
+/// [`CorruptedDatabase`]: ChainstoreError::CorruptedDatabase
+/// [`InvalidValidationIndex`]: ChainstoreError::InvalidValidationIndex
+/// [`Other`]: ChainstoreError::Other
+pub enum ChainstoreError {
+    /// The requested block header was not found in the store
+    HeaderNotFound,
+
+    /// The accumulator data exceeds the maximum allowed size of
+    /// [`MAX_ACCUMULATOR_SIZE`] bytes
+    OversizedAccumulator,
+
+    /// The database integrity check failed; data is corrupted
+    ///
+    /// Can be remedied by a full reindex
+    CorruptedDatabase,
+
+    /// The validation index references a block without a known height
+    ///
+    /// Usually indicates the block is orphaned or on an invalid chain;
+    /// Can be remedied by a full reindex
+    InvalidValidationIndex,
+
+    /// An unrecoverable error with a plain diagnostic message
+    ///
+    /// Covers implementation details such as I/O failures, lock poisoning,
+    /// capacity exhaustion, schema mismatches, and other non-actionable
+    /// conditions. Consumers should treat this as fatal and surface the
+    /// message for diagnostic purposes only.
+    Other(String),
+}
+
+impl Display for ChainstoreError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HeaderNotFound => {
+                write!(f, "the requested block header was not found")
+            }
+            Self::OversizedAccumulator => write!(
+                f,
+                "accumulator exceeds the maximum size of {} bytes",
+                MAX_ACCUMULATOR_SIZE
+            ),
+            Self::CorruptedDatabase => write!(
+                f,
+                "database integrity check failed; can be remedied by a full reindex"
+            ),
+            Self::InvalidValidationIndex => {
+                write!(
+                    f,
+                    "validation index has no known height; can be remedied by a full reindex"
+                )
+            }
+            Self::Other(msg) => write!(f, "other error: {msg}"),
+        }
+    }
+}
+
+impl error::Error for ChainstoreError {
+    /// Every variant describes the failure itself: the domain variants carry no inner error,
+    /// and [`Other`](ChainstoreError::Other) deliberately holds a plain diagnostic string
+    /// rather than a boxed error, so there is no source to expose.
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        None
+    }
+}
+
+/// Allows [`ChainstoreError`] to be used as the associated `Error` type of [`ChainStore`]
+impl DatabaseError for ChainstoreError {}
 
 /// A trait defining methods for interacting with our chain database. These methods will be used by
 /// the [ChainState](super::chain_state::ChainState) to save and retrieve data about the blockchain,
@@ -179,7 +280,7 @@ impl Decodable for DiskBlockHeader {
 }
 
 impl Encodable for DiskBlockHeader {
-    /// Encodes a `DiskBlockHeader` to a writer using the consensus encoding.
+    #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
         writer: &mut W,
@@ -254,6 +355,13 @@ impl BestChain {
 }
 
 impl Encodable for BestChain {
+    // INVARIANT: `len` accumulates the encoded size of one BestChain record. Each addend is
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "len accumulates the encoded size of one BestChain record, where each addend \
+                  is the byte count actually written, so the total is bounded by the record \
+                  size and cannot approach usize::MAX"
+    )]
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
         writer: &mut W,
@@ -286,6 +394,17 @@ impl Decodable for BestChain {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use std::io::Cursor;
 

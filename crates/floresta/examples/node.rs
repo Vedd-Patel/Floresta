@@ -5,6 +5,13 @@
 //! This will validate all blocks from genesis to the current tip, so it will take a while
 //! to sync.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "example code: panicking on setup failure keeps the example readable"
+)]
 use core::str::FromStr;
 use std::sync::Arc;
 

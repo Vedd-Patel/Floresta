@@ -17,3 +17,5 @@ pub mod server;
 mod blockchain;
 mod control;
 mod network;
+#[cfg(test)]
+mod test_fixture;

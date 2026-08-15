@@ -244,6 +244,7 @@ impl<T: JsonRPCClient> FlorestaRPC for T {
                 Value::Number(Number::from(start_height)),
                 Value::Number(Number::from(stop_height)),
                 Value::Bool(use_timestamp),
+                #[allow(clippy::expect_used, reason = "invariant above")]
                 serde_json::to_value(&confidence).expect("RescanConfidence implements Ser/De"),
             ],
         )
@@ -292,10 +293,15 @@ impl<T: JsonRPCClient> FlorestaRPC for T {
         if result.is_null() {
             return Err(Error::TxOutNotFound);
         }
-        serde_json::from_value(result).map_err(Error::Serde)
+        Ok(serde_json::from_value(result)?)
     }
 
     fn get_txout_proof(&self, txids: Vec<Txid>, blockhash: Option<BlockHash>) -> Result<String> {
+        #[allow(
+            clippy::expect_used,
+            reason = "Vec<Txid> serialises to a JSON array of strings, with no map keys or \
+                      non-finite floats involved, so this conversion cannot fail"
+        )]
         let params: Vec<Value> = match blockhash {
             Some(blockhash) => vec![
                 serde_json::to_value(txids)

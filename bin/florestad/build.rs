@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! Build script for florestad.
+//!
+//! Every failure here is a build-time failure: there is no caller to return an error to, and
+//! aborting the build with a clear message is the intended behaviour. The panicking helpers
+//! are therefore allowed throughout this file.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "build script: a panic aborts the build, which is the intended failure mode"
+)]
+
 fn main() {
     let version = get_version_from_git().unwrap_or_else(|| get_version_from_manifest().unwrap());
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();

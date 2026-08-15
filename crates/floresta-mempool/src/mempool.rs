@@ -73,8 +73,8 @@ impl MempoolBase for Mempool {
     /// This won't count transactions that are still in the queue.
     fn list_mempool(&self) -> Vec<Txid> {
         self.transactions
-            .keys()
-            .map(|id| self.transactions[id].transaction.compute_txid())
+            .values()
+            .map(|entry| entry.transaction.compute_txid())
             .collect()
     }
 
@@ -89,12 +89,12 @@ impl MempoolBase for Mempool {
         max_block_weight: u64,
     ) -> Block {
         // add transactions until we reach the block limit
-        let mut size = 0;
+        let mut size: u64 = 0;
 
         let mut txs = Vec::new();
         for tx in self.transactions.values() {
             let tx_size = tx.transaction.weight().to_wu();
-            if size + tx_size > max_block_weight {
+            if size.saturating_add(tx_size) > max_block_weight {
                 break;
             }
 
@@ -102,7 +102,7 @@ impl MempoolBase for Mempool {
                 continue;
             }
 
-            size += tx_size;
+            size = size.saturating_add(tx_size);
             let short_txid = self.hasher.hash_one(tx.transaction.compute_txid());
             self.add_transaction_to_block(&mut txs, short_txid);
         }
@@ -156,7 +156,9 @@ impl MempoolBase for Mempool {
                 // Remove this transaction from the mempool, and also remove it from the depends list of all
                 // its children, since they don't depend on it anymore.
                 if let Some(removed) = self.transactions.remove(&short_txid) {
-                    self.mempool_size -= removed.transaction.total_size();
+                    self.mempool_size = self
+                        .mempool_size
+                        .saturating_sub(removed.transaction.total_size());
 
                     for child in &removed.children {
                         if let Some(child_tx) = self.transactions.get_mut(child) {
@@ -192,7 +194,7 @@ impl MempoolBase for Mempool {
 
         // Make sure our mempool has space
         let tx_size = transaction.total_size();
-        if self.mempool_size + tx_size > self.max_mempool_size {
+        if self.mempool_size.saturating_add(tx_size) > self.max_mempool_size {
             return Err(MempoolError::FullMempool);
         }
 
@@ -213,8 +215,11 @@ impl MempoolBase for Mempool {
         // List dependants for this transaction
         let depends = self.find_mempool_depends(&transaction);
         for depend in depends.iter() {
-            let tx = self.transactions.get_mut(depend).unwrap();
-            tx.children.push(short_txid);
+            // `find_mempool_depends` only yields short txids already present in the map, but
+            // skip rather than panic if that ever stops holding.
+            if let Some(tx) = self.transactions.get_mut(depend) {
+                tx.children.push(short_txid);
+            }
         }
 
         // Insert it into our mempool
@@ -227,7 +232,7 @@ impl MempoolBase for Mempool {
                 children: Vec::new(),
             },
         );
-        self.mempool_size += tx_size;
+        self.mempool_size = self.mempool_size.saturating_add(tx_size);
 
         Ok(())
     }
@@ -264,7 +269,12 @@ impl Mempool {
         block_transactions: &mut Vec<Transaction>,
         short_txid: ShortTxid,
     ) {
-        let transaction = self.transactions.get(&short_txid).unwrap();
+        let Some(transaction) = self.transactions.get(&short_txid) else {
+            // The caller walks dependency links that are always present in the map; a miss
+            // means the entry was evicted concurrently, in which case there is nothing to add.
+            return;
+        };
+
         if block_transactions.contains(&transaction.transaction) {
             return;
         }
@@ -336,6 +346,17 @@ impl Mempool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use std::collections::HashSet;
 

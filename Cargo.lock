@@ -1051,6 +1051,7 @@ version = "0.5.0"
 dependencies = [
  "bitcoin",
  "floresta-chain",
+ "rustreexo",
 ]
 
 [[package]]
@@ -1130,6 +1131,7 @@ dependencies = [
  "metrics",
  "miniscript",
  "pretty_assertions",
+ "rand 0.10.1",
  "rcgen",
  "rustreexo",
  "serde",
@@ -1949,6 +1951,7 @@ dependencies = [
  "prometheus-client",
  "sysinfo",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

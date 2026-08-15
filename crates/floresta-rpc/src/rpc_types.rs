@@ -156,6 +156,13 @@ impl From<jsonrpc::Error> for Error {
     }
 }
 
+#[cfg(feature = "with-jsonrpc")]
+impl From<jsonrpc::simple_http::Error> for Error {
+    fn from(value: jsonrpc::simple_http::Error) -> Self {
+        Self::JsonRpc(value.into())
+    }
+}
+
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {

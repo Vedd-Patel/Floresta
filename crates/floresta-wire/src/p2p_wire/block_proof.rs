@@ -78,7 +78,7 @@ impl Bitmap {
     /// should be requested from our remote peer.
     pub fn push_input(&mut self, request: bool) {
         let bit_offset = self.n_inputs % u8::BITS;
-        self.n_inputs += 1;
+        self.n_inputs = self.n_inputs.saturating_add(1);
 
         // First bit of a new byte: push the byte (0 or 1)
         if bit_offset == 0 {
@@ -86,7 +86,7 @@ impl Bitmap {
             return;
         }
 
-        // Otherwise, if needed, set the bit in the already-present last byte
+        #[allow(clippy::expect_used, reason = "invariant above")]
         if request {
             *self.bytes.last_mut().expect("byte was pushed") |= 1u8 << bit_offset;
         }
@@ -99,6 +99,13 @@ impl Bitmap {
 }
 
 impl Encodable for Bitmap {
+    // INVARIANT: `len` sums the byte counts actually written for one message, bounded by
+    // the message size, so it cannot approach usize::MAX.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "len sums the byte counts actually written for one bitmap, bounded by the \
+                  message size, so it cannot approach usize::MAX"
+    )]
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
         writer: &mut W,
@@ -198,6 +205,11 @@ pub struct GetUtreexoProof {
 }
 
 impl Encodable for GetUtreexoProof {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "len sums the byte counts actually written for one message, bounded by the message \
+                  size, so it cannot approach usize::MAX"
+    )]
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
         writer: &mut W,
@@ -280,6 +292,17 @@ impl Decodable for UtreexoProof {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod utreexo_proof_tests {
     use bitcoin::Block;
     use bitcoin::BlockHash;

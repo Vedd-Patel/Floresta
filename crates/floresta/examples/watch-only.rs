@@ -2,6 +2,13 @@
 
 //! This example shows how to create a watch-only wallet, and drive it.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "example code: panicking on setup failure keeps the example readable"
+)]
 use bitcoin::ScriptBuf;
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::hex::FromHex;
@@ -17,7 +24,7 @@ fn main() {
     // the `AddressCacheDatabase` trait.
     let wallet_data = MemoryDatabase::new();
     // Then, we create the wallet itself.
-    let wallet = AddressCache::new(wallet_data);
+    let wallet = AddressCache::new(wallet_data).unwrap();
     // Now, we need to add the addresses we want to watch. We can add them one by one, or
     // we can add a descriptor that will generate the addresses for us. Here, we use a
     // descriptor that generates P2WPKH addresses. The descriptor is parsed using the
@@ -36,15 +43,17 @@ fn main() {
     // We can now add the descriptor to the wallet. This will generate the first 100 addresses
     // for us, and add them to the wallet.
     for i in 0..100 {
-        wallet.cache_address(bitcoin::ScriptBuf::from(
-            descriptor
-                .at_derivation_index(i)
-                .unwrap()
-                .explicit_script()
-                .unwrap()
-                .as_bytes()
-                .to_vec(),
-        ));
+        wallet
+            .cache_address(bitcoin::ScriptBuf::from(
+                descriptor
+                    .at_derivation_index(i)
+                    .unwrap()
+                    .explicit_script()
+                    .unwrap()
+                    .as_bytes()
+                    .to_vec(),
+            ))
+            .unwrap();
     }
     // We can now process some blocks. Here, we process the first 11 blocks of a custom
     // regtest network. Each coinbase some of the addresses derived above.
@@ -65,6 +74,7 @@ fn main() {
     let history = wallet
         .get_address_history(&hash)
         .unwrap()
+        .unwrap_or_default()
         .iter()
         .map(|tx| tx.hash)
         .collect::<Vec<_>>();

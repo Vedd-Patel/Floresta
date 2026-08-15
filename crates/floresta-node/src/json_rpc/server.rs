@@ -35,6 +35,8 @@ use corepc_types::ScriptSig;
 use corepc_types::v30::GetRawTransactionVerbose;
 use corepc_types::v31::RawTransactionInput;
 use corepc_types::v31::RawTransactionOutput;
+use floresta_chain::BlockchainError;
+use floresta_chain::BlockchainInterface;
 use floresta_chain::ThreadSafeChain;
 use floresta_common::NetworkExt;
 use floresta_compact_filters::flat_filters_store::FlatFiltersStore;
@@ -55,6 +57,7 @@ use tracing::info;
 
 use super::res::GetRawTransactionRes;
 use super::res::jsonrpc_interface::JsonRpcError;
+use crate::json_rpc::blockchain::BlockchainRpcError;
 use crate::json_rpc::request::RpcRequest;
 use crate::json_rpc::request::arg_parser::get_at;
 use crate::json_rpc::request::arg_parser::get_with_default;
@@ -63,10 +66,12 @@ use crate::json_rpc::res::RescanConfidence;
 use crate::json_rpc::res::jsonrpc_interface::Response;
 
 /// Expect message for `serde_json` serialization of types that implement `Serialize`.
-pub(super) const SERIALIZATION_EXPECT_MSG: &str = "types used in RPC responses implement Serialize";
+pub(super) const SERIALIZATION_EXPECT_MSG: &str =
+    "BUG: types used in RPC responses implement Serialize";
 
 /// Expect message for HTTP response builder with hardcoded valid headers.
-pub(super) const HTTP_RESPONSE_EXPECT: &str = "HTTP response built from valid hardcoded headers";
+pub(super) const HTTP_RESPONSE_EXPECT: &str =
+    "BUG: HTTP response built from valid hardcoded headers";
 
 /// The server holds this to tell which rpc method is awaiting to be processed and when the request were made.
 pub(super) struct InflightRpc {
@@ -78,9 +83,89 @@ pub(super) struct InflightRpc {
 ///
 /// Instead of using this very complex trait bound declaration on every impl block
 /// and function, this trait makes sure everything we need is implemented.
-pub trait RpcChain: ThreadSafeChain + Clone {}
+/// The chain backend is pinned to [`BlockchainError`] rather than left generic over an
+/// associated error type. Following the "concrete errors over generic trait errors" rule,
+/// this lets `?` convert chain failures into [`JsonRpcError`] directly, instead of every
+/// call site restating the conversion.
+pub trait RpcChain: ThreadSafeChain + BlockchainInterface<Error = BlockchainError> + Clone {}
 
-impl<T> RpcChain for T where T: ThreadSafeChain + Clone {}
+impl<T> RpcChain for T where
+    T: ThreadSafeChain + BlockchainInterface<Error = BlockchainError> + Clone
+{
+}
+
+/// Errors that originate in the JSON-RPC request pipeline itself.
+///
+/// These are failures of dispatch and payload handling — the envelope rather than the
+/// answer — kept apart from the endpoint-specific errors the handlers return.
+#[derive(Debug)]
+pub enum ServerError {
+    /// The request named a method the server does not implement.
+    UnknownMethod {
+        /// The method the client asked for.
+        method: String,
+    },
+
+    /// The request envelope was not valid JSON-RPC.
+    MalformedRequest,
+
+    /// The `jsonrpc` field held a version this server does not accept.
+    UnsupportedVersion,
+
+    /// A hex-encoded payload could not be decoded.
+    InvalidHex,
+
+    /// A decoded payload was not the type the method expected.
+    InvalidPayload {
+        /// What could not be decoded, for the client.
+        reason: String,
+    },
+
+    /// The method was called with a verbosity level it does not define.
+    UnsupportedVerbosity {
+        /// The level requested.
+        level: u8,
+    },
+}
+
+impl core::fmt::Display for ServerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnknownMethod { method } => write!(f, "unknown method {method:?}"),
+            Self::MalformedRequest => write!(f, "the request is not valid JSON-RPC"),
+            Self::UnsupportedVersion => {
+                write!(f, "the request declares an unsupported jsonrpc version")
+            }
+            Self::InvalidHex => write!(f, "the payload is not valid hex"),
+            Self::InvalidPayload { reason } => {
+                write!(f, "the payload could not be decoded: {reason}")
+            }
+            Self::UnsupportedVerbosity { level } => {
+                write!(f, "verbosity {level} is not supported by this method")
+            }
+        }
+    }
+}
+
+impl core::error::Error for ServerError {
+    /// Each variant describes what was wrong with the request itself.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        None
+    }
+}
+
+impl From<ServerError> for JsonRpcError {
+    fn from(e: ServerError) -> Self {
+        match e {
+            ServerError::UnknownMethod { .. } => Self::MethodNotFound,
+            ServerError::MalformedRequest => Self::InvalidRequest,
+            ServerError::UnsupportedVersion => Self::InvalidJsonRpcVersion,
+            ServerError::InvalidHex => Self::InvalidHex,
+            ServerError::InvalidPayload { reason } => Self::Decode(reason),
+            ServerError::UnsupportedVerbosity { .. } => Self::InvalidVerbosityLevel,
+        }
+    }
+}
 
 pub struct RpcImpl<Blockchain: RpcChain> {
     pub(super) block_filter_storage: Option<Arc<NetworkFilters<FlatFiltersStore>>>,
@@ -101,12 +186,12 @@ type Result<T> = std::result::Result<T, JsonRpcError>;
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     fn get_raw_transaction(&self, tx_id: Txid, verbosity: u8) -> Result<GetRawTransactionRes> {
         if verbosity > 1 {
-            return Err(JsonRpcError::InvalidVerbosityLevel);
+            return Err(ServerError::UnsupportedVerbosity { level: verbosity }.into());
         }
 
         let tx = self
             .wallet
-            .get_transaction(&tx_id)
+            .get_transaction(&tx_id)?
             .ok_or(JsonRpcError::TxNotFound)?;
 
         match verbosity {
@@ -114,7 +199,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             1 => Ok(GetRawTransactionRes::One(Box::new(
                 self.make_raw_transaction(tx)?,
             ))),
-            _ => Err(JsonRpcError::InvalidVerbosityLevel),
+            _ => Err(ServerError::UnsupportedVerbosity { level: verbosity }.into()),
         }
     }
 
@@ -123,7 +208,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         info!("Descriptor pushed: {descriptor}");
         debug!("Rescanning with block filters for addresses: {addresses:?}");
 
-        let addresses = self.wallet.get_cached_addresses();
+        let addresses = self.wallet.get_cached_addresses()?;
         let wallet = self.wallet.clone();
         let cfilters = self
             .block_filter_storage
@@ -152,7 +237,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
         if stop_height != 0 && start_height >= stop_height {
             // When stop height is a non zero value it needs atleast to be greater than start_height.
-            return Err(JsonRpcError::InvalidRescanVal);
+            return Err(BlockchainRpcError::InvalidRescanRange {
+                reason: "start height must be below the stop height",
+            }
+            .into());
         }
 
         // if we are on ibd, we don't have any filters to rescan
@@ -160,7 +248,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             return Err(JsonRpcError::InInitialBlockDownload);
         }
 
-        let addresses = self.wallet.get_cached_addresses();
+        let addresses = self.wallet.get_cached_addresses()?;
 
         if addresses.is_empty() {
             return Err(JsonRpcError::NoAddressesToRescan);
@@ -191,9 +279,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 
     async fn send_raw_transaction(&self, tx: String) -> Result<Txid> {
-        let tx_hex = Vec::from_hex(&tx).map_err(|_| JsonRpcError::InvalidHex)?;
-        let tx: Transaction =
-            deserialize(&tx_hex).map_err(|e| JsonRpcError::Decode(e.to_string()))?;
+        let tx_hex = Vec::from_hex(&tx).ok().ok_or(ServerError::InvalidHex)?;
+        let tx: Transaction = deserialize(&tx_hex).map_err(|e| ServerError::InvalidPayload {
+            reason: e.to_string(),
+        })?;
 
         Ok(self
             .node
@@ -203,6 +292,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "INVARIANT: all RPC response types implement Serialize and HTTP headers are hardcoded valid values"
+)]
 async fn handle_json_rpc_request(
     req: RpcRequest,
     state: Arc<RpcImpl<impl RpcChain>>,
@@ -216,7 +309,7 @@ async fn handle_json_rpc_request(
 
     if let Some(version) = jsonrpc {
         if !["1.0", "2.0"].contains(&version.as_str()) {
-            return Err(JsonRpcError::InvalidJsonRpcVersion);
+            return Err(ServerError::UnsupportedVersion.into());
         }
     }
 
@@ -330,7 +423,9 @@ async fn handle_json_rpc_request(
             let txid = get_at(&params, 0, "txid")?;
             let vout = get_at(&params, 1, "vout")?;
             let script: String = get_at(&params, 2, "script")?;
-            let script = ScriptBuf::from_hex(&script).map_err(|_| JsonRpcError::InvalidScript)?;
+            let script = ScriptBuf::from_hex(&script)
+                .ok()
+                .ok_or(JsonRpcError::InvalidScript)?;
             let height = get_at(&params, 3, "height")?;
 
             state.clone().find_tx_out(txid, vout, script, height).await
@@ -343,7 +438,7 @@ async fn handle_json_rpc_request(
             state
                 .get_block(hash, verbosity)
                 .await
-                .map(|v| serde_json::to_value(v).expect("GetBlockRes implements serde"))
+                .map(|v| serde_json::to_value(v).expect("BUG: GetBlockRes implements serde"))
         }
 
         "getblockfrompeer" => {
@@ -451,16 +546,23 @@ async fn handle_json_rpc_request(
                 .map(|v| serde_json::to_value(v).expect(SERIALIZATION_EXPECT_MSG))
         }
 
-        _ => Err(JsonRpcError::MethodNotFound),
+        unknown => Err(ServerError::UnknownMethod {
+            method: unknown.to_string(),
+        }
+        .into()),
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "INVARIANT: all RPC response types implement Serialize and HTTP headers are hardcoded valid values"
+)]
 async fn json_rpc_request(
     State(state): State<Arc<RpcImpl<impl RpcChain>>>,
     body: Bytes,
 ) -> HttpResponse<Body> {
     let Ok(req): std::result::Result<RpcRequest, _> = serde_json::from_slice(&body) else {
-        let error = JsonRpcError::InvalidRequest;
+        let error = JsonRpcError::from(ServerError::MalformedRequest);
         let body = Response::error(error.rpc_error(), Value::Null);
         return HttpResponse::builder()
             .status(error.http_code())
@@ -524,11 +626,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         for block in blocks {
             if let Ok(Some(block)) = node.get_block(block).await {
                 let height = chain
-                    .get_block_height(&block.block_hash())
-                    .map_err(|_| JsonRpcError::Chain)?
+                    .get_block_height(&block.block_hash())?
                     .ok_or(JsonRpcError::BlockNotFound)?;
 
-                wallet.block_process(&block, height);
+                let _ = wallet.block_process(&block, height);
             }
         }
 
@@ -611,7 +712,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         if in_active_chain {
             confirmations = self.chain.get_height().ok().and_then(|tip| {
                 if tip >= tx.height {
-                    Some((tip - tx.height + 1).into())
+                    Some(tip.saturating_sub(tx.height).saturating_add(1).into())
                 } else {
                     None
                 }
@@ -658,6 +759,10 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: hardcoded address string is always valid; listener local_addr succeeds after a successful bind; axum::serve failing means we cannot run at all"
+    )]
     pub async fn create(
         chain: Blockchain,
         wallet: Arc<AddressCache<KvDatabase>>,
@@ -673,14 +778,14 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         let address = address.unwrap_or_else(|| {
             format!("127.0.0.1:{}", network.default_rpc_port())
                 .parse()
-                .expect("hardcoded address is valid")
+                .expect("BUG: hardcoded address is valid")
         });
 
         let listener = match tokio::net::TcpListener::bind(address).await {
             Ok(listener) => {
                 let local_addr = listener
                     .local_addr()
-                    .expect("Infallible: listener binding was `Ok`");
+                    .expect("BUG: listener binding was `Ok`");
                 info!("RPC server is running at {local_addr}");
                 listener
             }
@@ -715,7 +820,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 
         axum::serve(listener, router)
             .await
-            .expect("failed to start rpc server");
+            .expect("BUG: failed to start rpc server");
     }
 }
 
@@ -749,14 +854,15 @@ pub(super) fn to_core_asm_string(script: &ScriptBuf, attempt_sighash_decode: boo
 
     let mut array_script_asm: Vec<String> = script_asm.split(' ').map(String::from).collect();
 
-    // Convert leading OP_0 to "0" - represents witness version 0
-    if array_script_asm[0] == "OP_0" {
-        array_script_asm[0] = "0".to_string();
-    }
-
-    // Convert leading OP_PUSHNUM_1 to "1" - represents witness version 1 (Taproot)
-    if array_script_asm[0] == "OP_PUSHNUM_1" {
-        array_script_asm[0] = "1".to_string();
+    // Convert a leading witness version opcode to its numeric form: OP_0 is witness
+    // version 0 and OP_PUSHNUM_1 is version 1 (Taproot). An empty script has no leading
+    // element to rewrite.
+    if let Some(first) = array_script_asm.first_mut() {
+        if first == "OP_0" {
+            *first = "0".to_string();
+        } else if first == "OP_PUSHNUM_1" {
+            *first = "1".to_string();
+        }
     }
 
     // If enabled, attempt to decode data elements as signatures and format them
@@ -805,8 +911,96 @@ fn try_parse_and_format_signature(signature_bytes: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
+    use bitcoin::hashes::Hash;
+
     use super::*;
+    use crate::json_rpc::res::RescanConfidence;
+    use crate::json_rpc::test_fixture::test_rpc;
+
+    /// `getrawtransaction` only defines verbosity 0 and 1; anything above must be rejected
+    /// by name rather than falling through to a default rendering.
+    #[test]
+    fn propagates_invalid_verbosity_level() {
+        let fixture = test_rpc();
+
+        for verbosity in [2_u8, 3, u8::MAX] {
+            let err = fixture
+                .rpc
+                .get_raw_transaction(Txid::all_zeros(), verbosity)
+                .unwrap_err();
+
+            assert!(
+                matches!(err, JsonRpcError::InvalidVerbosityLevel),
+                "verbosity {verbosity} should be rejected"
+            );
+        }
+    }
+
+    /// A transaction the wallet has never cached is reported as missing, not as a chain or
+    /// wallet fault, so the client can tell "not mine" from "something broke".
+    #[test]
+    fn propagates_tx_not_found_for_uncached_transaction() {
+        let fixture = test_rpc();
+
+        let err = fixture
+            .rpc
+            .get_raw_transaction(Txid::all_zeros(), 0)
+            .unwrap_err();
+
+        assert!(matches!(err, JsonRpcError::TxNotFound));
+    }
+
+    /// A descriptor that cannot be parsed is rejected as a wallet error that carries the reason,
+    /// so the client learns what was wrong with the descriptor rather than just that it
+    /// failed.
+    #[test]
+    fn propagates_wallet_error_for_invalid_descriptor() {
+        let fixture = test_rpc();
+
+        let err = fixture
+            .rpc
+            .load_descriptor("this is not a descriptor".to_string())
+            .unwrap_err();
+
+        match err {
+            JsonRpcError::Wallet(detail) => {
+                assert!(
+                    detail.contains("descriptor"),
+                    "the wallet error must explain what was rejected, got {detail:?}"
+                );
+            }
+            other => panic!("expected Wallet, got {other:?}"),
+        }
+    }
+
+    /// A rescan whose start is at or past its stop is a client mistake, reported as an
+    /// invalid rescan value.
+    #[test]
+    fn propagates_invalid_rescan_val_for_inverted_range() {
+        let fixture = test_rpc();
+
+        let err = fixture
+            .rpc
+            .rescan_blockchain(5, 1, false, RescanConfidence::Exact)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            JsonRpcError::InvalidRescanVal | JsonRpcError::InInitialBlockDownload
+        ));
+    }
 
     #[test]
     fn test_converter_script_into_asm_not_attempt_sighash_decode() {

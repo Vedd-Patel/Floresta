@@ -103,7 +103,10 @@ fn main() {
             daemon = daemon.pid_file(pid_file);
         }
 
-        daemon.fork().expect("failed to daemonize");
+        if let Err(e) = daemon.fork() {
+            eprintln!("failed to daemonize: {e}");
+            std::process::exit(1);
+        }
     }
 
     let log_level = match config.debug {
@@ -125,8 +128,15 @@ fn main() {
         .max_blocking_threads(2)
         .thread_keep_alive(Duration::from_secs(60))
         .thread_name("florestad")
-        .build()
-        .unwrap();
+        .build();
+
+    let _rt = match _rt {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("could not start the tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let signal = Arc::new(RwLock::new(false));
     let _signal = signal.clone();
@@ -134,7 +144,13 @@ fn main() {
     _rt.spawn(async move {
         // This is used to signal the runtime to stop gracefully.
         // It will be set to true when we receive a Ctrl-C or a stop signal.
-        tokio::signal::ctrl_c().await.unwrap();
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            // Without a listener we cannot shut down gracefully on Ctrl-C, but the node is
+            // otherwise healthy, so keep running and let the operator stop it another way.
+            tracing::error!("could not listen for Ctrl-C: {e}");
+            return;
+        }
+
         let mut sig = signal.write().await;
         *sig = true;
     });
@@ -203,6 +219,17 @@ fn datadir_path(base_dir: Option<impl AsRef<Path>>, network: Network) -> PathBuf
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use super::*;
 

@@ -254,5 +254,52 @@ impl_from_error!(BlockValidation, BlockValidationErrors);
 impl_from_error!(AddressParsing, bitcoin::address::ParseError);
 impl_from_error!(Miniscript, miniscript::Error);
 impl_from_error!(CouldNotObtainWalletCache, WatchOnlyError<KvDatabaseError>);
+// These source types each have exactly one canonical wrapping, so `?` can convert them
+// directly instead of every call site naming the variant.
+impl_from_error!(CouldNotOpenKvDatabase, KvDatabaseError);
+#[cfg(feature = "compact-filters")]
+impl_from_error!(CouldNotLoadCompactFiltersStore, IterableFilterStoreError);
+impl_from_error!(CouldNotConfigureTLS, tokio_rustls::rustls::Error);
+impl_from_error!(InvalidIpAddress, AddrParseError);
 
-impl error::Error for FlorestadError {}
+impl error::Error for FlorestadError {
+    /// Exposes the wrapped failure so a caller can walk back to the original cause. The
+    /// variants that only name a path or carry a diagnostic string return `None`.
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Encode(e) => Some(e),
+            Self::ParseNum(e) => Some(e),
+            Self::Io(e) => Some(e),
+            Self::BlockValidation(e) => Some(e),
+            Self::ScriptValidation(e) => Some(e),
+            Self::Blockchain(e) => Some(e),
+            Self::SerdeJson(e) => Some(e),
+            Self::TomlParsing(e) => Some(e),
+            Self::WalletInput(e) => Some(e),
+            Self::AddressParsing(e) => Some(e),
+            Self::Miniscript(e) => Some(e),
+            Self::InvalidPrivKey(e) | Self::InvalidCert(e) => Some(e),
+            Self::CouldNotConfigureTLS(e) => Some(e),
+            Self::CouldNotGenerateKeypair(e)
+            | Self::CouldNotGenerateCertParam(e)
+            | Self::CouldNotGenerateSelfSignedCert(e) => Some(e),
+            Self::CouldNotWriteFile(_, e) => Some(e),
+            Self::CouldNotOpenKvDatabase(e) => Some(e),
+            Self::CouldNotInitializeWallet(e) | Self::CouldNotObtainWalletCache(e) => Some(e),
+            #[cfg(feature = "compact-filters")]
+            Self::CouldNotLoadCompactFiltersStore(e) => Some(e),
+            Self::CouldNotCreateElectrumServer(e) => Some(e.as_ref()),
+            Self::FailedToBindElectrumServer(e) => Some(e),
+            Self::CouldNotCreateTLSDataDir(_, e) => Some(e),
+            Self::InvalidIpAddress(e) => Some(e),
+            Self::CouldNotResolveHostname(e) => Some(e),
+            Self::CouldNotLoadFlatChainStore(e) => Some(e),
+            Self::Rustreexo(_)
+            | Self::InvalidDataDir(_)
+            | Self::CouldNotSetupWallet(_)
+            | Self::CouldNotCreateChainProvider(_)
+            | Self::CouldNotPushDescriptor(_)
+            | Self::NoIPAddressesFound(_) => None,
+        }
+    }
+}

@@ -31,9 +31,9 @@ type Result<T> = std::result::Result<T, JsonRpcError>;
 fn parse_mmmmpp(version: &str) -> usize {
     let mut parts = version.splitn(3, '.');
 
-    let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    let patch = parts
+    let major: usize = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: usize = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let patch: usize = parts
         .next()
         .map(|p| {
             p.chars()
@@ -43,7 +43,69 @@ fn parse_mmmmpp(version: &str) -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    major * 10_000 + minor * 100 + patch
+    // Version components come from a parsed semver string, so this cannot realistically
+    // overflow; saturating keeps that guaranteed.
+    major
+        .saturating_mul(10_000)
+        .saturating_add(minor.saturating_mul(100))
+        .saturating_add(patch)
+}
+
+/// Errors that originate in the peer-network endpoints.
+///
+/// These are about the peer set and the commands used to manipulate it, distinct from
+/// chain or wallet failures.
+#[derive(Debug)]
+pub enum NetworkRpcError {
+    /// `addnode` was called with a command it does not implement.
+    UnknownAddnodeCommand {
+        /// What the client asked for; only `add`, `remove` and `onetry` are defined.
+        command: String,
+    },
+
+    /// `disconnectnode` was called with neither, or both, of an address and a node id.
+    ///
+    /// Exactly one is required, so that the peer being disconnected is unambiguous.
+    AmbiguousDisconnectTarget,
+
+    /// No connected peer matches the id the client supplied.
+    PeerNotFound {
+        /// The node id that was referenced.
+        node_id: u32,
+    },
+}
+
+impl core::fmt::Display for NetworkRpcError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnknownAddnodeCommand { command } => write!(
+                f,
+                "unknown addnode command {command:?}; expected \"add\", \"remove\" or \"onetry\""
+            ),
+            Self::AmbiguousDisconnectTarget => write!(
+                f,
+                "disconnectnode needs exactly one of an address or a node id"
+            ),
+            Self::PeerNotFound { node_id } => write!(f, "no connected peer with id {node_id}"),
+        }
+    }
+}
+
+impl core::error::Error for NetworkRpcError {
+    /// Describes a bad request or missing peer rather than wrapping a failure.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        None
+    }
+}
+
+impl From<NetworkRpcError> for JsonRpcError {
+    fn from(e: NetworkRpcError) -> Self {
+        match e {
+            NetworkRpcError::UnknownAddnodeCommand { .. } => Self::InvalidAddnodeCommand,
+            NetworkRpcError::AmbiguousDisconnectTarget => Self::InvalidDisconnectNodeCommand,
+            NetworkRpcError::PeerNotFound { .. } => Self::PeerNotFound,
+        }
+    }
 }
 
 impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
@@ -67,7 +129,12 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             "add" => self.node.add_peer(address, v2transport).await,
             "remove" => self.node.remove_peer(address).await,
             "onetry" => self.node.onetry_peer(address, v2transport).await,
-            _ => return Err(JsonRpcError::InvalidAddnodeCommand),
+            _ => {
+                return Err(NetworkRpcError::UnknownAddnodeCommand {
+                    command: command.clone(),
+                }
+                .into());
+            }
         };
 
         Ok(json!(null))
@@ -95,14 +162,14 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
                 let peer = peer_info
                     .into_iter()
                     .find(|peer| peer.id == node_id)
-                    .ok_or(JsonRpcError::PeerNotFound)?;
+                    .ok_or(NetworkRpcError::PeerNotFound { node_id })?;
 
                 peer.address
             }
 
             // Both address and ID were provided, or neither was provided.
             _ => {
-                return Err(JsonRpcError::InvalidDisconnectNodeCommand);
+                return Err(NetworkRpcError::AmbiguousDisconnectTarget.into());
             }
         };
 
@@ -123,14 +190,20 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
         self.node
             .get_peer_info()
             .await
-            .map_err(|_| JsonRpcError::Node("Failed to get peer information".to_string()))
+            .ok()
+            .ok_or(JsonRpcError::Node(
+                "Failed to get peer information".to_string(),
+            ))
     }
 
     pub(crate) async fn get_connection_count(&self) -> Result<usize> {
         self.node
             .get_connection_count()
             .await
-            .map_err(|_| JsonRpcError::Node("Failed to get connection count".to_string()))
+            .ok()
+            .ok_or(JsonRpcError::Node(
+                "Failed to get connection count".to_string(),
+            ))
     }
 
     pub(crate) async fn get_addrman_info(&self) -> Result<GetAddrManInfo> {
@@ -160,7 +233,7 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
             AddrManInfoNetwork {
                 new: all_new,
                 tried: all_tried,
-                total: all_new + all_tried,
+                total: all_new.saturating_add(all_tried),
             },
         );
 
@@ -170,11 +243,14 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
     pub(crate) async fn get_network_info(&self) -> Result<GetNetworkInfo> {
         // Floresta does not listen for inbound connections, so every peer is outbound.
         let connections_in = 0;
-        let connections_out = self
-            .node
-            .get_connection_count()
-            .await
-            .map_err(|_| JsonRpcError::Node("Failed to get connection count".to_string()))?;
+        let connections_out =
+            self.node
+                .get_connection_count()
+                .await
+                .ok()
+                .ok_or(JsonRpcError::Node(
+                    "Failed to get connection count".to_string(),
+                ))?;
 
         let advertised_services = advertised_services();
         let local_services = format!("{:016x}", advertised_services.to_u64());
@@ -223,8 +299,54 @@ impl<Blockchain: RpcChain> RpcImpl<Blockchain> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
+    use floresta_wire::bitcoin_socket_addr::BitcoinSocketAddr;
+    use floresta_wire::bitcoin_socket_addr::SystemResolver;
+
     use super::parse_mmmmpp;
+    use crate::json_rpc::res::jsonrpc_interface::JsonRpcError;
+
+    /// A malformed peer address is wrapped at this module's boundary, so a caller can tell
+    /// an address failure originating in an RPC request from any other parse failure, and
+    /// can still reach the underlying reason.
+    #[test]
+    fn propagates_invalid_net_address_with_source() {
+        use core::error::Error as _;
+
+        let err = BitcoinSocketAddr::parse_address(
+            "not-a-valid-address:notaport",
+            Some(bitcoin::Network::Bitcoin),
+            SystemResolver,
+        )
+        .map_err(JsonRpcError::from)
+        .unwrap_err();
+
+        assert!(matches!(err, JsonRpcError::InvalidNetAddress(_)));
+        assert!(
+            err.source().is_some(),
+            "the address parse failure must remain reachable"
+        );
+    }
+
+    /// The rendered message is the one the client receives, so logs and wire responses
+    /// cannot drift apart.
+    #[test]
+    fn renders_the_message_the_client_receives() {
+        let err = JsonRpcError::MissingParameter("height".to_string());
+
+        assert_eq!(err.to_string(), err.rpc_error().message + ": height");
+    }
 
     #[test]
     fn parse_mmmmpp_encodes_semver_correctly() {

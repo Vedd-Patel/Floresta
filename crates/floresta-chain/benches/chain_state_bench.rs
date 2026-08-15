@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::map_err_ignore,
+    clippy::wildcard_enum_match_arm,
+    reason = "benchmark harness: a panic means the fixture is broken, which should fail the run"
+)]
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::hint::black_box;

@@ -144,7 +144,8 @@ impl BitcoinSocketAddr {
         port_str
             .map(str::parse)
             .transpose()
-            .map_err(|_| InvalidAddressError::InvalidPort)?
+            .ok()
+            .ok_or(InvalidAddressError::InvalidPort)?
             .or_else(|| network.map(Self::default_p2p_port))
             .ok_or(InvalidAddressError::MissingPort)
     }
@@ -245,7 +246,7 @@ impl BitcoinSocketAddr {
             .and_then(|address| {
                 // Denies anything after the `]`
                 let pos = address.find("]")?;
-                if (pos + 1) != address.len() {
+                if pos.saturating_add(1) != address.len() {
                     return None;
                 }
 
@@ -369,8 +370,9 @@ impl BitcoinSocketAddr {
 
         let port = Self::parse_port_if_present(port, network)?;
 
-        let decoded_address =
-            OnionV3Addr::from_str(address).map_err(|_| InvalidAddressError::InvalidAddress)?;
+        let decoded_address = OnionV3Addr::from_str(address)
+            .ok()
+            .ok_or(InvalidAddressError::InvalidAddress)?;
         Ok(Self {
             address: AddrV2::TorV3(decoded_address.into_bytes()),
             port,
@@ -457,6 +459,17 @@ impl From<BitcoinSocketAddr> for AddrV2 {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use std::io;
     use std::net::IpAddr;

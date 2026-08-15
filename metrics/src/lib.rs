@@ -11,6 +11,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 use sysinfo::System;
+use tracing::error;
 
 pub struct AppMetrics {
     registry: Registry,
@@ -91,15 +92,31 @@ pub fn get_metrics() -> &'static AppMetrics {
 
 async fn metrics_handler() -> String {
     let mut buffer = String::new();
-    encode(&mut buffer, &get_metrics().registry).unwrap();
+    if let Err(e) = encode(&mut buffer, &get_metrics().registry) {
+        error!("failed to encode metrics: {e}");
+        return String::new();
+    }
 
     buffer
 }
 
+/// Serves the Prometheus metrics endpoint until the process exits.
+///
+/// This is spawned as a detached task, so a failure here cannot be propagated to a caller.
+/// Binding or serving errors are logged and the task returns, leaving the rest of the node
+/// running without a metrics endpoint.
 pub async fn metrics_server(metrics_server_address: SocketAddr) {
     let app = Router::new().route("/", get(metrics_handler));
-    let listener = tokio::net::TcpListener::bind(metrics_server_address)
-        .await
-        .unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    let listener = match tokio::net::TcpListener::bind(metrics_server_address).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("could not bind metrics server to {metrics_server_address}: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = axum::serve(listener, app).await {
+        error!("metrics server stopped: {e}");
+    }
 }

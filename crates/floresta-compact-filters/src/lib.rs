@@ -61,6 +61,18 @@ pub enum IterableFilterStoreError {
 
     /// The filter is larger than [`MAX_FILTER_SIZE`](crate::flat_filters_store::MAX_FILTER_SIZE).
     OversizedBlockFilter,
+
+    /// A filter references a block height the chain does not know about.
+    ///
+    /// Usually means the filter store is ahead of the chainstate and needs a reindex. The
+    /// chain's own error is kept as a diagnostic string, following the convention set for
+    /// `ChainstoreError::Other`.
+    BlockNotFound { height: u32, source: String },
+
+    /// A stored filter could not be matched against the query.
+    ///
+    /// See the inner error for more information.
+    FilterMatch(bip158::Error),
 }
 
 impl Display for IterableFilterStoreError {
@@ -70,11 +82,36 @@ impl Display for IterableFilterStoreError {
             Self::Eof => write!(f, "The IterableFilterStore reached EOF"),
             Self::PoisonedLock => write!(f, "The lock is poisoned"),
             Self::OversizedBlockFilter => write!(f, "The filter is too large"),
+            Self::BlockNotFound { height, source } => write!(
+                f,
+                "No block at height {height} ({source}); the filter store may need a reindex"
+            ),
+            Self::FilterMatch(e) => write!(f, "Could not match against a stored filter: {e:?}"),
         }
     }
 }
 
-impl error::Error for IterableFilterStoreError {}
+impl error::Error for IterableFilterStoreError {
+    /// Exposes the wrapped failure. `BlockNotFound` keeps the chain's message as a string
+    /// (the backend's error type is generic and not nameable here), and the remaining
+    /// variants describe the failure themselves.
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::FilterMatch(e) => Some(e),
+            Self::Eof
+            | Self::PoisonedLock
+            | Self::OversizedBlockFilter
+            | Self::BlockNotFound { .. } => None,
+        }
+    }
+}
+
+impl From<bip158::Error> for IterableFilterStoreError {
+    fn from(e: bip158::Error) -> Self {
+        Self::FilterMatch(e)
+    }
+}
 
 impl From<io::Error> for IterableFilterStoreError {
     fn from(e: io::Error) -> Self {

@@ -134,6 +134,14 @@ macro_rules! acchashes {
 
 #[doc(hidden)]
 // This const function is used to validate hash literals at compile time
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "i is bounded by the 'while i < bytes.len()' guard, so bytes[i] is always in \
+              bounds and i never exceeds the 64 bytes checked above, so the increment cannot \
+              overflow; slice get is not const-stable, and in a const fn any violation would \
+              be a compile-time error anyway"
+)]
 pub const fn validate_hash_compile_time(s: &str) -> Result<(), &str> {
     let bytes = s.as_bytes();
 
@@ -177,6 +185,17 @@ macro_rules! try_and_warn {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod test {
     use super::validate_hash_compile_time as validate_hash;
 

@@ -6,6 +6,13 @@
 //! is useful for indexing metaprotocols, tracking recent fee rates, and detecting new spends from
 //! wallets with unknown balances.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "example code: panicking on setup failure keeps the example readable"
+)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
