@@ -6,6 +6,13 @@
 //! is useful for indexing metaprotocols, tracking recent fee rates, and detecting new spends from
 //! wallets with unknown balances.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "example code: panicking on setup failure keeps the example readable"
+)]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -87,7 +94,7 @@ async fn main() {
     // the block data after we have validated it. This saves a lot of space, but it means that
     // we can't serve blocks to other nodes or rescan the blockchain without downloading
     // it again.
-    let chain_store_config = FlatChainStoreConfig::new_with_path(DATA_DIR);
+    let chain_store_config = FlatChainStoreConfig::new(DATA_DIR);
     let chain_store =
         FlatChainStore::new(chain_store_config).expect("failed to open the blockchain database");
 
