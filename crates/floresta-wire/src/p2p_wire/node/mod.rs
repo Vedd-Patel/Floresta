@@ -7,10 +7,10 @@
 mod blocks;
 pub mod chain_selector_ctx;
 mod conn;
-mod peer_man;
+pub mod peer_man;
 pub mod running_ctx;
 pub mod sync_ctx;
-mod user_req;
+pub mod user_req;
 
 use core::fmt::Debug;
 use std::collections::HashMap;
@@ -375,12 +375,20 @@ where
                 startup_time: Instant::now(),
                 // The last 1k blocks account for 50% of the EMA weight, the last 2k for 75%, etc.
                 block_sync_avg: Ema::with_half_life_1000(),
-                last_filter: chain.get_block_hash(0).unwrap(),
+                #[allow(clippy::expect_used, reason = "invariant above")]
+                last_filter: chain
+                    .get_block_hash(0)
+                    .expect("chainstate always knows the genesis block"),
                 block_filters,
                 inflight: HashMap::new(),
                 inflight_user_requests: HashMap::new(),
                 peer_id_count: 0,
                 peers: HashMap::new(),
+                #[allow(
+                    clippy::expect_used,
+                    reason = "an initialised chainstate always has a validation index, and the \
+                              node is only built on top of one"
+                )]
                 last_block_request: chain.get_validation_index().expect("Invalid chain"),
                 chain,
                 peer_ids: Vec::new(),
