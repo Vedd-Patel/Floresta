@@ -51,9 +51,7 @@ impl MerkleProof {
         self.hashes.clone()
     }
 
-    /// Creates a new proof from a list of hashes and a target. Target is a 64 bits
-    /// unsigned integer indicating the index of a transaction we with to prove. Note that
-    /// this only proves one tx at the time.
+    #[allow(clippy::indexing_slicing, reason = "invariant above")]
     pub fn from_block_hashes(tx_list: Vec<sha256d::Hash>, target: u64) -> Self {
         let target_hash = tx_list[target as usize];
         let (_, proof) = Self::transverse(tx_list, Vec::new(), target);
@@ -132,6 +130,11 @@ impl MerkleProof {
 
         // This if catches an edge case where we try to get a sibling from the last node
         // in a non-perfect tree. This yields an out-of-bound read from nodes.
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "sibling and target both index into the current row, and the check above \
+                      rules out the one out-of-bounds case (the last node of a non-perfect tree)"
+        )]
         if sibling != nodes.len() as u64 {
             proof.push(nodes[sibling as usize]);
         } else {
@@ -148,6 +151,13 @@ impl MerkleProof {
             node_count.div_ceil(2)
         };
 
+        #[allow(
+            clippy::indexing_slicing,
+            clippy::arithmetic_side_effects,
+            reason = "`idx` runs over `0..node_count.div_ceil(2)`, so `2 * idx` is always a valid \
+                      index and `2 * idx + 1` is bounds-checked before use. Neither can overflow, as \
+                      `node_count` is a transaction count within one block"
+        )]
         for idx in 0..pairs {
             if (2 * idx + 1) >= node_count {
                 new_nodes.push(Self::parent_hash(
@@ -186,6 +196,11 @@ impl Decodable for MerkleProof {
 }
 
 impl Encodable for MerkleProof {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "len accumulates the byte counts actually written for one proof, bounded by the proof \
+                  size, so it cannot approach usize::MAX"
+    )]
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
         writer: &mut W,
@@ -206,6 +221,17 @@ impl Encodable for MerkleProof {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod test {
     use core::str::FromStr;
 

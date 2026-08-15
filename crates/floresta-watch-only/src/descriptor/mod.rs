@@ -37,6 +37,18 @@ impl_error_from!(DescriptorError, Slip132Error, XpubParseError);
 impl_error_from!(DescriptorError, MiniscriptError, MiniscriptError);
 impl_error_from!(DescriptorError, NonDefiniteKeyError, DeriveDescriptorError);
 
+impl core::error::Error for DescriptorError {
+    /// Exposes the underlying parse or miniscript failure so callers can walk the chain.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::XpubParseError(e) => Some(e),
+            Self::MiniscriptError(e) => Some(e),
+            Self::DeriveDescriptorError(e) => Some(e),
+            Self::XpubNetworkMismatch(_) => None,
+        }
+    }
+}
+
 impl Display for DescriptorError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
@@ -116,7 +128,7 @@ pub(crate) fn derive_addresses_from_descriptor(
 ) -> Result<Vec<ScriptBuf>, DescriptorError> {
     let descriptors = parse_and_split_descriptor(descriptor)?;
 
-    let mut addresses = Vec::with_capacity(descriptors.len() * quantity as usize);
+    let mut addresses = Vec::with_capacity(descriptors.len().saturating_mul(quantity as usize));
     for desc in descriptors {
         addresses.extend_from_slice(&derive_addresses_from_parsed_descriptor(
             desc, index, quantity,
@@ -134,7 +146,9 @@ fn derive_addresses_from_parsed_descriptor(
     quantity: u32,
 ) -> Result<Vec<ScriptBuf>, DescriptorError> {
     let mut addresses = Vec::with_capacity(quantity as usize);
-    for i in index..index + quantity {
+    // Derivation indexes are bounded by the BIP32 hardened boundary, so a range that would
+    // wrap past u32::MAX simply stops at the maximum rather than overflowing.
+    for i in index..index.saturating_add(quantity) {
         let address = descriptor.at_derivation_index(i)?.script_pubkey();
         addresses.push(address);
     }
@@ -143,6 +157,17 @@ fn derive_addresses_from_parsed_descriptor(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod test {
     use std::vec;
 

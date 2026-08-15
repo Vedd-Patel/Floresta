@@ -117,6 +117,20 @@ pub enum Error {
     XpubMultisigUnsupported,
 }
 
+impl core::error::Error for Error {
+    /// Exposes the underlying base58 or BIP32 failure, so a caller can walk the chain back
+    /// to what actually rejected the key.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Base58(e) => Some(e),
+            Self::Bip32(e) => Some(e),
+            Self::UnknownSlip32Prefix | Self::XprivUnsupported | Self::XpubMultisigUnsupported => {
+                None
+            }
+        }
+    }
+}
+
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
@@ -138,7 +152,8 @@ impl Display for Error {
 fn extract_slip132_prefix(s: &str) -> Result<[u8; 4], Error> {
     let data = base58::decode_check(s)?;
     let mut prefix = [0u8; 4];
-    prefix.copy_from_slice(&data[0..4]);
+    let version = data.get(0..4).ok_or(Error::UnknownSlip32Prefix)?;
+    prefix.copy_from_slice(version);
 
     validate_slip132_prefix(prefix)?;
 
@@ -191,7 +206,9 @@ impl FromSlip132 for Xpub {
 
             _ => return Err(Error::UnknownSlip32Prefix),
         };
-        data[0..4].copy_from_slice(&bip44_prefix);
+        data.get_mut(0..4)
+            .ok_or(Error::UnknownSlip32Prefix)?
+            .copy_from_slice(&bip44_prefix);
 
         let xpub = Self::decode(&data)?;
 
@@ -232,6 +249,17 @@ pub(super) fn is_xpub_mainnet(s: &str) -> Result<bool, Error> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod test {
     use super::*;
 
