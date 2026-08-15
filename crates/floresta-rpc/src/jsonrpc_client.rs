@@ -5,6 +5,7 @@ use core::fmt::Debug;
 use serde::Deserialize;
 
 use crate::rpc::JsonRPCClient;
+use crate::rpc_types::Error;
 
 // Define a Client struct that wraps a jsonrpc::Client
 #[derive(Debug)]
@@ -18,19 +19,29 @@ pub struct JsonRPCConfig {
 }
 
 impl Client {
-    // Constructor to create a new Client with a URL
-    pub fn new(url: String) -> Self {
-        let client =
-            jsonrpc::Client::simple_http(&url, None, None).expect("Failed to create client");
-        Self(client)
+    /// Constructs a new client pointed at `url`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::JsonRpc`] if `url` cannot be parsed into a transport target, for
+    /// example when the scheme, host or port is malformed.
+    pub fn new(url: String) -> Result<Self, Error> {
+        let client = jsonrpc::Client::simple_http(&url, None, None)?;
+
+        Ok(Self(client))
     }
 
-    // Constructor to create a new Client with a configuration
-    pub fn new_with_config(config: JsonRPCConfig) -> Self {
+    /// Constructs a new client from a full configuration, including credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::JsonRpc`] if the configured URL cannot be parsed into a transport
+    /// target, for example when the scheme, host or port is malformed.
+    pub fn new_with_config(config: JsonRPCConfig) -> Result<Self, Error> {
         let client =
-            jsonrpc::Client::simple_http(&config.url, config.user.clone(), config.pass.clone())
-                .expect("Failed to create client");
-        Self(client)
+            jsonrpc::Client::simple_http(&config.url, config.user.clone(), config.pass.clone())?;
+
+        Ok(Self(client))
     }
 
     // Method to make an RPC call

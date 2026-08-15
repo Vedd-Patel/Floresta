@@ -25,6 +25,17 @@ pub mod rpc_types;
 // TODO (Davidson): work on windows?
 
 #[cfg(all(test, feature = "with-jsonrpc", not(target_os = "windows")))]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use core::str::FromStr;
     use std::fs;
@@ -108,7 +119,7 @@ mod tests {
             .spawn()
             .unwrap_or_else(|e| panic!("Couldn't launch florestad at {florestad_path}: {e}"));
 
-        let client = Client::new(format!("http://127.0.0.1:{port}"));
+        let client = Client::new(format!("http://127.0.0.1:{port}")).unwrap();
 
         let mut retries = 10;
         loop {
