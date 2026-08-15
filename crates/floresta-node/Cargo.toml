@@ -39,6 +39,8 @@ metrics = { workspace = true,  optional = true }
 
 [dev-dependencies]
 pretty_assertions = { version = "=1.4.1" }
+# Unique temp-dir names for the JSON-RPC test fixture.
+rand = { workspace = true }
 
 [target.'cfg(target_env = "gnu")'.dependencies]
 libc = { version = "=0.2.186" }
