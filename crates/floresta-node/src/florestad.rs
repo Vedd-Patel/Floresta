@@ -323,10 +323,9 @@ impl Florestad {
     )]
     fn resolve_hostname(hostname: &str, default_port: u16) -> Result<SocketAddr, FlorestadError> {
         if !hostname.contains(':') {
-            return hostname
-                .parse()
-                .map(|ip| SocketAddr::new(ip, default_port))
-                .map_err(FlorestadError::InvalidIpAddress);
+            let ip = hostname.parse()?;
+
+            return Ok(SocketAddr::new(ip, default_port));
         }
 
         let ip = hostname.parse();
@@ -356,7 +355,10 @@ impl Florestad {
                     .map(|x| x.parse().unwrap_or(default_port))
                     .unwrap_or(default_port);
 
-                SocketAddr::new(ips[0], port)
+                let ip = ips
+                    .first()
+                    .ok_or_else(|| FlorestadError::NoIPAddressesFound(hostname.to_string()))?;
+                SocketAddr::new(*ip, port)
             }
         };
 
@@ -386,12 +388,10 @@ impl Florestad {
 
         #[cfg(feature = "compact-filters")]
         let cfilters = if self.config.cfilters {
-            let filter_store = FlatFiltersStore::new(datadir.join("cfilters"));
-            let cfilters = Arc::new(NetworkFilters::new(filter_store));
+            let filter_store = FlatFiltersStore::new(datadir.join("cfilters"))?;
+            let cfilters = Arc::new(NetworkFilters::new(filter_store)?);
 
-            let height = cfilters
-                .get_height()
-                .map_err(FlorestadError::CouldNotLoadCompactFiltersStore)?;
+            let height = cfilters.get_height()?;
 
             info!("Loaded compact filters store at height {height}");
             Some(cfilters)
@@ -487,6 +487,11 @@ impl Florestad {
                 proxy,
             ));
 
+            #[allow(
+                clippy::panic,
+                reason = "start runs once per Florestad, so nothing else has set this OnceLock by the \
+                          time we get here"
+            )]
             if self.json_rpc.set(server).is_err() {
                 core::panic!("We should be the first one setting this");
             }
@@ -660,7 +665,9 @@ impl Florestad {
     fn validate_data_dir(path: impl AsRef<Path>) -> Result<(), FlorestadError> {
         let path = path.as_ref();
 
-        let md = fs::metadata(path).map_err(|_| FlorestadError::InvalidDataDir(path.into()))?;
+        let md = fs::metadata(path)
+            .ok()
+            .ok_or_else(|| FlorestadError::InvalidDataDir(path.into()))?;
         if !md.is_dir() {
             return Err(FlorestadError::InvalidDataDir(path.to_path_buf()));
         }
@@ -692,24 +699,19 @@ impl Florestad {
             None => datadir.join("config.toml"),
         };
 
-        let data = ConfigFile::from_file(&path);
-
-        if let Ok(data) = data {
-            data
-        } else {
-            match data.unwrap_err() {
-                FlorestadError::TomlParsing(e) => {
-                    warn!("Could not parse config file, ignoring it");
-                    debug!("{e}");
-                    ConfigFile::default()
-                }
-                FlorestadError::Io(e) => {
-                    warn!("Could not read config file, ignoring it");
-                    debug!("{e}");
-                    ConfigFile::default()
-                }
-                // Shouldn't be any other error
-                _ => unreachable!(),
+        match ConfigFile::from_file(&path) {
+            Ok(data) => data,
+            Err(FlorestadError::TomlParsing(e)) => {
+                warn!("Could not parse config file, ignoring it");
+                debug!("{e}");
+                ConfigFile::default()
+            }
+            Err(e) => {
+                // `ConfigFile::from_file` only reports parse and I/O failures, but fall back
+                // to the default config for anything else rather than aborting startup.
+                warn!("Could not read config file, ignoring it");
+                debug!("{e}");
+                ConfigFile::default()
             }
         }
     }
@@ -731,7 +733,7 @@ impl Florestad {
         network: Network,
         assume_valid: AssumeValidArg,
     ) -> Result<ChainState<ChainStore>, FlorestadError> {
-        let chain_store_config = FlatChainStoreConfig::new_with_path(datadir.as_ref().join("chaindata"));
+        let chain_store_config = FlatChainStoreConfig::new(datadir.as_ref().join("chaindata"));
 
         let chain_store = ChainStore::new(chain_store_config)
             .map_err(|e| FlorestadError::CouldNotLoadFlatChainStore(e.into()))?;
@@ -742,8 +744,7 @@ impl Florestad {
 
     /// Setup the wallet by initializing the database and adding descriptors, xpubs, and addresses.
     fn setup_wallet(&self) -> Result<AddressCache<KvDatabase>, FlorestadError> {
-        let database = KvDatabase::new(&self.config.datadir)
-            .map_err(FlorestadError::CouldNotOpenKvDatabase)?;
+        let database = KvDatabase::new(&self.config.datadir)?;
 
         let wallet =
             AddressCache::new(database).map_err(FlorestadError::CouldNotInitializeWallet)?;
@@ -833,7 +834,7 @@ impl Florestad {
     /// Testnet3 => 30001 (30002 TLS)
     /// Regtest  => 20001 (20002 TLS)
     fn get_default_electrum_port(network: Network, enable_electrum_tls: bool) -> u16 {
-        let mut electrum_port = match network {
+        let mut electrum_port: u16 = match network {
             Network::Bitcoin => 50001,
             Network::Signet => 60001,
             Network::Testnet4 => 40001,
@@ -842,7 +843,7 @@ impl Florestad {
         };
 
         if enable_electrum_tls {
-            electrum_port += 1;
+            electrum_port = electrum_port.saturating_add(1);
         }
 
         electrum_port
@@ -908,8 +909,7 @@ impl Florestad {
         // Assemble the TLS configuration.
         let tls_config = ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![tls_cert_chain], tls_key)
-            .map_err(FlorestadError::CouldNotConfigureTLS)?;
+            .with_single_cert(vec![tls_cert_chain], tls_key)?;
 
         Ok(Arc::new(tls_config))
     }
