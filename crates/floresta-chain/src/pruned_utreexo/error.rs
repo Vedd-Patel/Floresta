@@ -109,7 +109,31 @@ impl Display for BlockchainError {
     }
 }
 
-impl Error for BlockchainError {}
+impl Error for BlockchainError {
+    /// Exposes the wrapped failure so a caller can walk back to the original cause.
+    ///
+    /// `Database` holds a [`DatabaseError`], which is deliberately only `Debug + Display`
+    /// rather than [`Error`], so it cannot be surfaced here; its message is already carried
+    /// by [`Display`]. `AccumulatorError` wraps rustreexo's `StumpError`, which likewise
+    /// does not implement [`Error`]. The remaining variants carry no inner error.
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::BlockValidation(e) => Some(e),
+            Self::TransactionError(e) => Some(e),
+            Self::UtreexoLeaf(e) => Some(e),
+            Self::OperationOverflow(e) => Some(e),
+            Self::BlockNotPresent
+            | Self::OrphanOrInvalidBlock
+            | Self::InvalidUtreexoProof
+            | Self::AccumulatorError(_)
+            | Self::Database(_)
+            | Self::ChainNotInitialized
+            | Self::InvalidTip(_)
+            | Self::BadValidationIndex
+            | Self::Unsupported(_) => None,
+        }
+    }
+}
 
 impl<T: DatabaseError> From<T> for BlockchainError {
     fn from(value: T) -> Self {
@@ -176,6 +200,13 @@ macro_rules! tx_err {
 impl Display for TransactionError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "Transaction {} is invalid: {}", self.txid, self.error)
+    }
+}
+
+impl Error for TransactionError {
+    /// The validation failure that made this transaction invalid.
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -258,6 +289,8 @@ impl Display for BlockValidationErrors {
     }
 }
 
+impl Error for BlockValidationErrors {}
+
 impl<T: DatabaseError> From<T> for BlockchainBuilderError {
     fn from(value: T) -> Self {
         Self::Database(Box::new(value))
@@ -267,3 +300,70 @@ impl<T: DatabaseError> From<T> for BlockchainBuilderError {
 impl_error_from!(BlockchainError, TransactionError, TransactionError);
 impl_error_from!(BlockchainError, BlockValidationErrors, BlockValidation);
 impl_error_from!(BlockchainError, StumpError, AccumulatorError);
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
+mod tests {
+    use bitcoin::Txid;
+    use bitcoin::hashes::Hash;
+
+    use super::*;
+
+    /// A validation failure reaches the caller wrapped, and the chain can be walked back to
+    /// the specific rule that rejected the block.
+    #[test]
+    fn preserves_source_chain_through_transaction_error() {
+        let inner = TransactionError {
+            txid: Txid::all_zeros(),
+            error: BlockValidationErrors::NotEnoughMoney,
+        };
+        let err = BlockchainError::TransactionError(inner);
+
+        let source = err.source().expect("TransactionError must expose a source");
+        assert_eq!(
+            source.to_string(),
+            TransactionError {
+                txid: Txid::all_zeros(),
+                error: BlockValidationErrors::NotEnoughMoney,
+            }
+            .to_string()
+        );
+
+        // and one level deeper, to the validation rule itself
+        let root = source.source().expect("the validation error is the root");
+        assert_eq!(
+            root.to_string(),
+            BlockValidationErrors::NotEnoughMoney.to_string()
+        );
+    }
+
+    /// Block validation failures are wrapped rather than flattened into a message.
+    #[test]
+    fn preserves_source_chain_through_block_validation() {
+        let err = BlockchainError::BlockValidation(BlockValidationErrors::BadMerkleRoot);
+
+        let source = err.source().expect("BlockValidation must expose a source");
+        assert_eq!(
+            source.to_string(),
+            BlockValidationErrors::BadMerkleRoot.to_string()
+        );
+    }
+
+    /// Variants that describe a condition themselves have no source to expose.
+    #[test]
+    fn domain_variants_have_no_source() {
+        assert!(BlockchainError::BlockNotPresent.source().is_none());
+        assert!(BlockchainError::ChainNotInitialized.source().is_none());
+        assert!(BlockchainError::Unsupported("get_tx").source().is_none());
+    }
+}
