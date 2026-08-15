@@ -67,6 +67,88 @@ pub struct RunningNode {
     pub(crate) inflight_filters: BTreeMap<u32, BlockFilter>,
 }
 
+/// Errors that originate while driving a running node.
+///
+/// The running context owns the backfill state file, so its failures are reported here
+/// rather than as a bare I/O error: "the backfill state is corrupt, restart from genesis"
+/// is a different remedy from any other I/O problem in the wire crate.
+#[derive(Debug)]
+pub enum RunningCtxError {
+    /// The on-disk backfill state could not be parsed.
+    ///
+    /// A short file, a bad accumulator or a malformed height all mean the same thing to the
+    /// caller: the file is unusable and backfill has to restart from genesis.
+    CorruptedBackfillState {
+        /// What specifically failed to parse, for diagnostics.
+        reason: &'static str,
+    },
+}
+
+impl std::fmt::Display for RunningCtxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CorruptedBackfillState { reason } => write!(
+                f,
+                "backfill state is corrupted ({reason}); it will be rebuilt from genesis"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RunningCtxError {
+    /// The parse failures this wraps carry no useful inner error of their own, so there is
+    /// no source to expose.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
+/// Builds the error reported when the on-disk backfill state cannot be parsed.
+fn corrupted_backfill_state(reason: &'static str) -> WireError {
+    WireError::RunningCtx(RunningCtxError::CorruptedBackfillState { reason })
+}
+
+/// Parses the on-disk backfill state into its accumulator and the tip/end heights.
+///
+/// The trailing 8 bytes are the two heights; everything before them is the serialised
+/// accumulator.
+///
+/// # Errors
+///
+/// Returns [`RunningCtxError::CorruptedBackfillState`] if the buffer is too short to hold
+/// the heights, or if the accumulator cannot be decoded. Both mean the same thing to the
+/// caller: the state file is unusable and backfill has to restart from genesis.
+fn parse_backfill_state(state: &[u8]) -> Result<(Stump, u32, u32), WireError> {
+    let split = state
+        .len()
+        .checked_sub(8)
+        .ok_or_else(|| corrupted_backfill_state("file is shorter than the trailing heights"))?;
+
+    let (acc_bytes, heights) = state.split_at(split);
+    let (tip_bytes, end_bytes) = heights.split_at(4);
+
+    let acc = match Stump::deserialize(acc_bytes) {
+        Ok(acc) => acc,
+        Err(_) => return Err(corrupted_backfill_state("accumulator could not be decoded")),
+    };
+
+    let tip = u32::from_le_bytes(
+        tip_bytes
+            .try_into()
+            .ok()
+            .ok_or_else(|| corrupted_backfill_state("tip height is malformed"))?,
+    );
+
+    let end = u32::from_le_bytes(
+        end_bytes
+            .try_into()
+            .ok()
+            .ok_or_else(|| corrupted_backfill_state("end height is malformed"))?,
+    );
+
+    Ok((acc, tip, end))
+}
+
 impl NodeContext for RunningNode {
     const REQUEST_TIMEOUT: u64 = 2 * 60;
 
@@ -210,32 +292,18 @@ where
                     return Ok(false);
                 }
 
-                let acc = Stump::deserialize(&state[..(state.len() - 8)]).map_err(|_| WireError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupted backfill state")))?;
-                let tip = u32::from_le_bytes(
-                    state[(state.len() - 8)..(state.len() - 4)]
-                        .try_into()
-                        .map_err(|_| WireError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupted backfill state")))?,
-                );
+                // The trailing 8 bytes are the tip and end heights; everything before them
+                // is the serialised accumulator. Split once, with a length check, so a short
+                // or truncated file is reported rather than panicking on a slice.
+                let (acc, tip, end) = parse_backfill_state(&state)?;
+                info!("Recovering backfill node from state tip={tip}, end={end}");
 
-                let end = u32::from_le_bytes(state[(state.len() - 4)..].try_into().map_err(|_| WireError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupted backfill state")))?);
-                info!("Recovering backfill node from state tip={tip}, end={tip}");
-
-                (
-                    self.chain
-                        .get_partial_chain(tip, end, acc)?,
-                    end,
-                )
+                (self.chain.get_partial_chain(tip, end, acc)?, end)
             }
             Err(_) => {
                 // if the file doesn't exist or got corrupted, start from genesis
-                let end = self
-                    .chain
-                    .get_validation_index()?;
-                (
-                    self.chain
-                        .get_partial_chain(0, end, Stump::default())?,
-                    end,
-                )
+                let end = self.chain.get_validation_index()?;
+                (self.chain.get_partial_chain(0, end, Stump::default())?, end)
             }
         };
 
@@ -259,7 +327,7 @@ where
                     return;
                 }
 
-                if let Err(_) = done_flag.send(()) {
+                if done_flag.send(()).is_err() {
                     error!("Failed to send done flag");
                 }
 
@@ -273,7 +341,9 @@ where
                         } else {
                             ser_acc.extend_from_slice(&tip.to_le_bytes());
                             ser_acc.extend_from_slice(&end.to_le_bytes());
-                            if let Err(e) = std::fs::write(datadir.join(".sync_node_state"), ser_acc) {
+                            if let Err(e) =
+                                std::fs::write(datadir.join(".sync_node_state"), ser_acc)
+                            {
                                 error!("Failed to write sync node state: {:?}", e);
                             }
                         }
@@ -298,7 +368,7 @@ where
             },
         );
 
-        let _ = tokio::task::spawn(fut);
+        drop(tokio::task::spawn(fut));
         Ok(true)
     }
 
@@ -362,7 +432,10 @@ where
 
         self.last_block_request = self.chain.get_validation_index().unwrap_or(0);
         if let Some(ref cfilters) = self.block_filters {
-            if let Ok(hash) = self.chain.get_block_hash(cfilters.get_height().unwrap_or(1)) {
+            if let Ok(hash) = self
+                .chain
+                .get_block_hash(cfilters.get_height().unwrap_or(1))
+            {
                 self.last_filter = hash;
             }
         }
@@ -520,17 +593,13 @@ where
         }
 
         info!("Downloading filters from height {}", filters.get_height()?);
-        let stop = if height + 500 > best_height {
-            best_height
-        } else {
-            height + 500
-        };
+        let stop = height.saturating_add(500).min(best_height);
 
         let stop_hash = self.chain.get_block_hash(stop)?;
         self.last_filter = stop_hash;
 
         let peer = self.send_to_fast_peer(
-            NodeRequest::GetFilter((stop_hash, height + 1)),
+            NodeRequest::GetFilter((stop_hash, height.saturating_add(1))),
             ServiceFlags::COMPACT_FILTERS,
         )?;
 
@@ -548,7 +617,7 @@ where
         }
 
         let mut blocks = Vec::new();
-        for i in (next + 1)..=tip {
+        for i in next.saturating_add(1)..=tip {
             let hash = self.chain.get_block_hash(i)?;
             // already requested
             if self.inflight.contains_key(&InflightRequests::Blocks(hash)) {
@@ -581,10 +650,10 @@ where
     /// decides which peer to drop based on whether they've timely inv-ed us about the last
     /// 6 blocks.
     fn get_peer_score(&self, peer: PeerId) -> u32 {
-        let mut score = 0;
-        for block in self.context.last_invs.keys() {
-            if self.context.last_invs[block].1.contains(&peer) {
-                score += 1;
+        let mut score: u32 = 0;
+        for peers in self.context.last_invs.values() {
+            if peers.1.contains(&peer) {
+                score = score.saturating_add(1);
             }
         }
 
@@ -712,7 +781,11 @@ where
                         );
                         self.inflight.remove(&InflightRequests::Headers);
 
-                        let peer_info = self.peers.get(&peer).cloned().ok_or(WireError::PeerNotFound)?;
+                        let peer_info = self
+                            .peers
+                            .get(&peer)
+                            .cloned()
+                            .ok_or(WireError::PeerNotFound)?;
                         let is_extra = matches!(peer_info.kind, ConnectionKind::Extra);
 
                         if is_extra {
@@ -813,19 +886,19 @@ where
                                 return Ok(());
                             };
 
-                            if current_height + 1 != this_height {
+                            if current_height.saturating_add(1) != this_height {
                                 self.context.inflight_filters.insert(this_height, filter);
                                 return Ok(());
                             }
 
-                            filters.push_filter(filter, current_height + 1)?;
-                            current_height += 1;
+                            filters.push_filter(filter, current_height.saturating_add(1))?;
+                            current_height = current_height.saturating_add(1);
 
                             while let Some(filter) =
                                 self.context.inflight_filters.remove(&(current_height))
                             {
                                 filters.push_filter(filter, current_height)?;
-                                current_height += 1;
+                                current_height = current_height.saturating_add(1);
                             }
 
                             filters.save_height(current_height)?;
@@ -839,12 +912,85 @@ where
                         }
                     }
 
-                    _ => unreachable!(
-                        "Error: `handle_peer_msg_common` should have handled remaining PeerMessages"
-                    ),
+                    // `handle_peer_msg_common` handles these before we get here; enumerating
+                    // them keeps a newly added variant from silently falling through.
+                    PeerMessages::Addr(_)
+                    | PeerMessages::NotFound(_)
+                    | PeerMessages::Transaction(_)
+                    | PeerMessages::UtreexoState(_)
+                    | PeerMessages::CFHeaders(_) => {}
                 }
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
+mod tests {
+    use rustreexo::stump::Stump;
+
+    use super::RunningCtxError;
+    use super::parse_backfill_state;
+    use crate::p2p_wire::error::WireError;
+
+    /// Asserts the failure is reported as this module's own corrupted-state error, and
+    /// returns the reason so a test can check it names the right part.
+    fn corrupt_reason(err: &WireError) -> &'static str {
+        match err {
+            WireError::RunningCtx(RunningCtxError::CorruptedBackfillState { reason }) => reason,
+            other => panic!("expected RunningCtx(CorruptedBackfillState), got {other:?}"),
+        }
+    }
+
+    /// A state file shorter than the 8 trailing height bytes cannot be parsed, and must be
+    /// reported rather than panicking on the slice.
+    #[test]
+    fn propagates_corrupted_backfill_state_when_truncated() {
+        for len in 0..8 {
+            let err = parse_backfill_state(&vec![0_u8; len]).unwrap_err();
+            assert_eq!(
+                corrupt_reason(&err),
+                "file is shorter than the trailing heights"
+            );
+        }
+    }
+
+    /// Trailing heights present but the accumulator bytes are garbage.
+    #[test]
+    fn propagates_corrupted_backfill_state_on_bad_accumulator() {
+        // A non-empty, invalid accumulator followed by two valid heights.
+        let mut state = vec![0xff_u8; 3];
+        state.extend_from_slice(&7_u32.to_le_bytes());
+        state.extend_from_slice(&9_u32.to_le_bytes());
+
+        let err = parse_backfill_state(&state).unwrap_err();
+        assert_eq!(corrupt_reason(&err), "accumulator could not be decoded");
+    }
+
+    /// A well-formed state round-trips into its accumulator and both heights.
+    #[test]
+    fn parses_well_formed_backfill_state() {
+        let mut state = Vec::new();
+        Stump::default().serialize(&mut state).unwrap();
+        state.extend_from_slice(&11_u32.to_le_bytes());
+        state.extend_from_slice(&42_u32.to_le_bytes());
+
+        let (acc, tip, end) = parse_backfill_state(&state).unwrap();
+
+        assert_eq!(acc, Stump::default());
+        assert_eq!(tip, 11);
+        assert_eq!(end, 42);
     }
 }
