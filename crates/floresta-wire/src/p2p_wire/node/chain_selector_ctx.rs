@@ -117,6 +117,50 @@ pub enum ChainSelectorState {
     Done,
 }
 
+/// Errors that originate while choosing which chain to follow.
+///
+/// Chain selection is the one place where a peer actively lying to us is an expected
+/// outcome rather than a fault, so those conditions get their own type: a caller can tell
+/// "a peer fed us a bad accumulator" from any other wire failure, and react by banning that
+/// peer rather than by retrying.
+#[derive(Debug)]
+pub enum ChainSelectorError {
+    /// A peer sent an accumulator that does not decode.
+    ///
+    /// The peer is either buggy or lying; either way it should be disconnected and banned.
+    MalformedAccumulator {
+        /// What was wrong with it, for the ban log.
+        reason: &'static str,
+    },
+
+    /// We could not agree on a single chain with the peers we have.
+    ///
+    /// Every candidate was disproved or every peer was unresponsive, so there is nothing to
+    /// select. The node should gather more peers and try again.
+    NoAgreementReached,
+}
+
+impl std::fmt::Display for ChainSelectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedAccumulator { reason } => {
+                write!(f, "a peer sent a malformed accumulator ({reason})")
+            }
+            Self::NoAgreementReached => write!(
+                f,
+                "could not agree on a chain with the peers we have; will retry with more peers"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChainSelectorError {
+    /// These describe peer behaviour rather than wrapping a lower-level failure.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+}
+
 pub enum FindAccResult {
     Found(Vec<u8>),
     KeepLooking(Vec<(PeerId, Vec<u8>)>),
@@ -173,11 +217,19 @@ where
             return Ok(());
         }
 
-        info!(
-            "Downloading headers from peer={peer} at height={} hash={}",
-            self.chain.get_best_block()?.0 + 1,
-            headers[0].block_hash()
-        );
+        #[allow(
+            clippy::arithmetic_side_effects,
+            clippy::indexing_slicing,
+            reason = "the `headers.is_empty()` guard above returns early, so index 0 exists. Chain \
+                      heights are far below u32::MAX, so the increment cannot overflow"
+        )]
+        {
+            info!(
+                "Downloading headers from peer={peer} at height={} hash={}",
+                self.chain.get_best_block()?.0 + 1,
+                headers[0].block_hash()
+            );
+        }
 
         for header in headers.iter() {
             if let Err(e) = self.chain.accept_header(*header) {
@@ -193,7 +245,10 @@ where
             }
         }
 
-        let last = headers.last().expect("BUG: headers is not empty").block_hash();
+        let last = headers
+            .last()
+            .expect("BUG: headers is not empty")
+            .block_hash();
         self.context
             .tip_cache
             .entry(peer)
@@ -214,14 +269,22 @@ where
             return Ok(Stump::default());
         }
         let Some((leaf_count, roots_bytes)) = acc.split_first_chunk::<8>() else {
-            return Err(WireError::PeerMisbehaving);
+            return Err(ChainSelectorError::MalformedAccumulator {
+                reason: "leaf count header is truncated",
+            }
+            .into());
         };
         let leaves = u64::from_le_bytes(*leaf_count);
 
         let expected_roots = leaves.count_ones() as usize;
+
+        #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
         let expected_roots_len = expected_roots * 32;
         if roots_bytes.len() != expected_roots_len {
-            return Err(WireError::PeerMisbehaving);
+            return Err(ChainSelectorError::MalformedAccumulator {
+                reason: "root count does not match the leaf count",
+            }
+            .into());
         }
 
         let mut roots = Vec::with_capacity(expected_roots);
@@ -321,6 +384,11 @@ where
                 break;
             }
 
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "this is a binary search bounded by the chain tip height, so both the \
+                          addition and the subtraction stay within valid block heights"
+            )]
             if peer1_acc == peer2_acc {
                 // if they're equal, then the disagreement is in a newer block
                 height += interval / 2;
@@ -343,6 +411,11 @@ where
         // Initializing the agree bool for the block on which we landed on
         let agree = peer1_acc == peer2_acc;
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "height is a valid block height found by the search above, so stepping one block \
+                      either way stays within the chain"
+        )]
         if agree {
             height += 1;
         } else {
@@ -362,6 +435,10 @@ where
             match agree {
                 true => {
                     // they agreed in the last block, so the fork is in the next one
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "INVARIANT: height is a valid block height > 0 here"
+                    )]
                     if peer1_acc != peer2_acc {
                         fork = height - 1;
                     }
@@ -379,7 +456,7 @@ where
                 break;
             }
 
-            // if we still don't know where the fork is, we need to keep looking
+            #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
             if agree {
                 // if they agree on this current block, we need to look in the next one
                 height += 1;
@@ -402,11 +479,11 @@ where
             (None, None) => return Ok(PeerCheck::BothUnresponsivePeers),
         };
 
-        hash = self.chain.get_block_hash(fork + 1)?;
+        hash = self.chain.get_block_hash(fork.saturating_add(1))?;
 
         // now we know where the fork is, we need to check who is lying
         let (peer1_acc, peer2_acc) = self
-            .grab_both_peers_version(peer1, peer2, hash, fork + 1)
+            .grab_both_peers_version(peer1, peer2, hash, fork.saturating_add(1))
             .await?;
 
         // if a peer is unresponsive, we opt for an early return
@@ -417,7 +494,7 @@ where
             (None, None) => return Ok(PeerCheck::BothUnresponsivePeers),
         };
 
-        let block_hash = self.chain.get_block_hash(fork + 1)?;
+        let block_hash = self.chain.get_block_hash(fork.saturating_add(1))?;
 
         let inflight_block = match self.get_block_and_proof(peer1, block_hash).await {
             Err(WireError::PeerTimeout) => return Ok(PeerCheck::UnresponsivePeer(peer1)),
@@ -428,7 +505,13 @@ where
             .aux_data
             .ok_or(WireError::BlockProofNotFound)?;
 
-        let acc1 = self.update_acc(agreed, &inflight_block.block, proof, &leaf_data, fork + 1)?;
+        let acc1 = self.update_acc(
+            agreed,
+            &inflight_block.block,
+            proof,
+            &leaf_data,
+            fork.saturating_add(1),
+        )?;
 
         let peer1_acc = Self::parse_acc(&peer1_acc)?;
         let peer2_acc = Self::parse_acc(&peer2_acc)?;
@@ -455,6 +538,11 @@ where
     ) -> Result<InflightBlock, WireError> {
         self.send_to_peer(peer, NodeRequest::GetBlock(vec![block_hash]))?;
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "a 60 second offset from now cannot overflow the Instant representation \
+                      on any supported platform"
+        )]
         let timeout = Instant::now() + Duration::from_secs(60);
         let mut block = None;
         loop {
@@ -521,7 +609,18 @@ where
                         aux_data: Some((uproof.leaf_data, proof, peer)),
                     });
                 }
-                _ => {}
+                // Enumerated so that adding a PeerMessages variant forces a review of every
+                // dispatch site rather than being silently ignored here.
+                PeerMessages::NewBlock(_)
+                | PeerMessages::Headers(_)
+                | PeerMessages::Addr(_)
+                | PeerMessages::Ready(_)
+                | PeerMessages::Disconnected(_)
+                | PeerMessages::NotFound(_)
+                | PeerMessages::Transaction(_)
+                | PeerMessages::UtreexoState(_)
+                | PeerMessages::BlockFilter(_)
+                | PeerMessages::CFHeaders(_) => {}
             }
         }
     }
@@ -549,7 +648,10 @@ where
     /// This method will find what the accumulator looks like for a block with (height, hash).
     /// Check-out [this](https://blog.dlsouza.lol/2023/09/28/pow-fraud-proof.html) post
     /// to learn how the cut-and-choose protocol works
-    #[allow(clippy::expect_used, reason = "INVARIANT: candidate_accs has exactly 1 element")]
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: candidate_accs has exactly 1 element"
+    )]
     async fn find_accumulator_for_block(
         &mut self,
         height: u32,
@@ -572,11 +674,15 @@ where
         }
 
         let mut invalid_accs = HashSet::new();
-        for peer in candidate_accs.windows(2) {
-            if invalid_accs.contains(&peer[0].1) || invalid_accs.contains(&peer[1].1) {
+        for window in candidate_accs.windows(2) {
+            // `windows(2)` always yields exactly two elements; destructuring keeps that
+            // guarantee visible to the compiler instead of indexing.
+            let [first, second] = window else { continue };
+
+            if invalid_accs.contains(&first.1) || invalid_accs.contains(&second.1) {
                 continue;
             }
-            let (peer1, peer2) = (peer[0].0, peer[1].0);
+            let (peer1, peer2) = (first.0, second.0);
 
             let liar_state = self.find_who_is_lying(peer1, peer2).await?;
 
@@ -584,10 +690,10 @@ where
                 PeerCheck::OneLying(liar) => {
                     self.disconnect_and_ban(liar)?;
                     if liar == peer1 {
-                        invalid_accs.insert(peer[0].1.clone());
+                        invalid_accs.insert(first.1.clone());
                         continue;
                     }
-                    invalid_accs.insert(peer[1].1.clone());
+                    invalid_accs.insert(second.1.clone());
                 }
                 PeerCheck::UnresponsivePeer(dead_peer) => {
                     self.disconnect_and_ban(dead_peer)?;
@@ -600,8 +706,8 @@ where
                     self.disconnect_and_ban(peer1)?;
                     self.disconnect_and_ban(peer2)?;
 
-                    invalid_accs.insert(peer[0].1.clone());
-                    invalid_accs.insert(peer[1].1.clone());
+                    invalid_accs.insert(first.1.clone());
+                    invalid_accs.insert(second.1.clone());
                 }
             }
         }
@@ -610,7 +716,12 @@ where
         //we should have only one candidate left
         assert_eq!(candidate_accs.len(), 1);
 
-        Self::parse_acc(&candidate_accs.pop().expect("BUG: candidate_accs has exactly 1 element").1)
+        Self::parse_acc(
+            &candidate_accs
+                .pop()
+                .expect("BUG: candidate_accs has exactly 1 element")
+                .1,
+        )
     }
 
     /// If we get an empty `headers` message, our next action depends on which state are
@@ -666,7 +777,7 @@ where
 
                 self.context.state = ChainSelectorState::Done;
             }
-            _ => {}
+            ChainSelectorState::CreatingConnections | ChainSelectorState::Done => {}
         }
 
         Ok(())
@@ -679,16 +790,14 @@ where
         let peers = self
             .peer_by_service
             .get(&service_flags::UTREEXO.into())
-            .ok_or(WireError::NoPeersAvailable)?;
+            .ok_or(ChainSelectorError::NoAgreementReached)?;
 
         let rand_peer = *peers
             .choose(&mut rng())
-            .ok_or(WireError::NoPeersAvailable)?;
+            .ok_or(ChainSelectorError::NoAgreementReached)?;
 
         let block = self.get_block_and_proof(rand_peer, fork).await?;
-        let (leaf_data, proof, _) = block
-            .aux_data
-            .ok_or(WireError::BlockProofNotFound)?;
+        let (leaf_data, proof, _) = block.aux_data.ok_or(WireError::BlockProofNotFound)?;
 
         let (del_hashes, inputs) =
             proof_util::process_proof(&leaf_data, &block.block.txdata, fork_height, |h| {
@@ -731,7 +840,7 @@ where
     async fn check_tips(&mut self) -> Result<(), WireError> {
         let (height, _) = self.chain.get_best_block()?;
         let validation_index = self.chain.get_validation_index()?;
-        if (validation_index + 100) < height {
+        if validation_index.saturating_add(100) < height {
             let mut tips = self.chain.get_chain_tips()?;
             let (height, hash) = self.chain.get_best_block()?;
             let acc = self.find_accumulator_for_block(height, hash).await?;
@@ -744,7 +853,8 @@ where
                 );
 
                 self.context.state = ChainSelectorState::Done;
-                self.chain.mark_chain_as_assumed(acc, tips[0])?;
+                let tip = tips.first().ok_or(ChainSelectorError::NoAgreementReached)?;
+                self.chain.mark_chain_as_assumed(acc, *tip)?;
                 self.chain.update_ibd(IBDState::Done);
             }
             // if we have more than one tip, we need to check if our best chain has an invalid block
@@ -908,7 +1018,10 @@ where
         Ok(LoopControl::Continue)
     }
 
-    #[allow(clippy::expect_used, reason = "INVARIANT: peer_accs has at least 1 element")]
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: peer_accs has at least 1 element"
+    )]
     async fn find_accumulator_for_block_step(
         &mut self,
         block: BlockHash,
@@ -926,7 +1039,7 @@ where
         }
 
         if self.inflight.is_empty() {
-            return Err(WireError::NoPeersAvailable);
+            return Err(ChainSelectorError::NoAgreementReached.into());
         }
 
         let mut peer_accs = Vec::new();
@@ -965,7 +1078,12 @@ where
 
         if peer_accs.len() == 1 {
             warn!("Only one peers with the UTREEXO_FILTER service flag");
-            return Ok(FindAccResult::Found(peer_accs.pop().expect("BUG: peer_accs has exactly 1 element").1));
+            return Ok(FindAccResult::Found(
+                peer_accs
+                    .pop()
+                    .expect("BUG: peer_accs has exactly 1 element")
+                    .1,
+            ));
         }
 
         let mut accs = HashSet::new();
@@ -975,7 +1093,12 @@ where
 
         // if all peers have the same state, we can assume it's the correct one
         if accs.len() == 1 {
-            return Ok(FindAccResult::Found(peer_accs.pop().expect("BUG: peer_accs has at least 1 element").1));
+            return Ok(FindAccResult::Found(
+                peer_accs
+                    .pop()
+                    .expect("BUG: peer_accs has at least 1 element")
+                    .1,
+            ));
         }
 
         // if we have different states, we need to keep looking until we find the
@@ -1049,15 +1172,34 @@ where
                 }
             }
 
-            _ => {}
+            // Enumerated so that adding a PeerMessages variant forces a review of every
+            // dispatch site rather than being silently ignored here.
+            PeerMessages::NewBlock(_)
+            | PeerMessages::Addr(_)
+            | PeerMessages::NotFound(_)
+            | PeerMessages::Transaction(_)
+            | PeerMessages::UtreexoState(_)
+            | PeerMessages::BlockFilter(_)
+            | PeerMessages::UtreexoProof(_)
+            | PeerMessages::CFHeaders(_) => {}
         }
         Ok(())
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
-    #![allow(clippy::expect_used)]
     use std::sync::Arc;
 
     use floresta_chain::ChainState;
@@ -1093,33 +1235,46 @@ mod tests {
         let header_truncated_min = parse_acc(&header_truncated_min_wire);
         assert!(matches!(
             header_truncated_min,
-            Err(WireError::PeerMisbehaving)
+            Err(WireError::ChainSelector(
+                ChainSelectorError::MalformedAccumulator { .. }
+            ))
         ));
 
         let header_truncated_max_wire = vec![0u8; 7];
         let header_truncated_max = parse_acc(&header_truncated_max_wire);
         assert!(matches!(
             header_truncated_max,
-            Err(WireError::PeerMisbehaving)
+            Err(WireError::ChainSelector(
+                ChainSelectorError::MalformedAccumulator { .. }
+            ))
         ));
 
         let roots_missing_wire = 1u64.to_le_bytes().to_vec();
         let roots_missing = parse_acc(&roots_missing_wire);
-        assert!(matches!(roots_missing, Err(WireError::PeerMisbehaving)));
+        assert!(matches!(
+            roots_missing,
+            Err(WireError::ChainSelector(
+                ChainSelectorError::MalformedAccumulator { .. }
+            ))
+        ));
 
         let mut roots_one_byte_short_wire = 1u64.to_le_bytes().to_vec();
         roots_one_byte_short_wire.extend([0u8; 31]);
         let roots_one_byte_short = parse_acc(&roots_one_byte_short_wire);
         assert!(matches!(
             roots_one_byte_short,
-            Err(WireError::PeerMisbehaving)
+            Err(WireError::ChainSelector(
+                ChainSelectorError::MalformedAccumulator { .. }
+            ))
         ));
 
         let roots_excess_count_wire = serialize_acc(8, 2);
         let roots_excess_count = parse_acc(&roots_excess_count_wire);
         assert!(matches!(
             roots_excess_count,
-            Err(WireError::PeerMisbehaving)
+            Err(WireError::ChainSelector(
+                ChainSelectorError::MalformedAccumulator { .. }
+            ))
         ));
 
         let mut roots_trailing_byte_wire = serialize_acc(1, 1);
@@ -1127,7 +1282,9 @@ mod tests {
         let roots_trailing_byte = parse_acc(&roots_trailing_byte_wire);
         assert!(matches!(
             roots_trailing_byte,
-            Err(WireError::PeerMisbehaving)
+            Err(WireError::ChainSelector(
+                ChainSelectorError::MalformedAccumulator { .. }
+            ))
         ));
 
         let leaves_8_one_root_wire = serialize_acc(8, 1);
