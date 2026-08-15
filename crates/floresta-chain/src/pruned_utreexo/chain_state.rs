@@ -975,6 +975,9 @@ impl<PersistedState: ChainStore> ChainState<PersistedState> {
         };
 
         let mut acc = acc.as_slice();
+        // A `From<StumpError>` impl would be the idiomatic conversion here, but the blanket
+        // `impl<T: DatabaseError> From<T> for BlockchainError` makes any additional `From`
+        // impl incoherent. Until that blanket impl is removed, this wrapping stays explicit.
         Stump::deserialize(&mut acc).map_err(BlockchainError::AccumulatorError)
     }
 
@@ -2446,7 +2449,7 @@ mod test {
 
     #[test]
     fn test_calculate_chain_work() {
-        let mut chainstore = FlatChainStore::new(FlatChainStoreConfig::new_with_path(
+        let mut chainstore = FlatChainStore::new(FlatChainStoreConfig::new(
             "../../testdata/signet_headers.zst",
         ))
         .unwrap();
@@ -2513,7 +2516,7 @@ mod test {
 
     #[test]
     fn propagates_block_not_present() {
-        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded);
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
         let missing = BlockHash::all_zeros();
         let err = chain.get_block_header(&missing).unwrap_err();
         assert!(matches!(err, BlockchainError::BlockNotPresent));
@@ -2521,28 +2524,28 @@ mod test {
 
     #[test]
     fn propagates_unsupported_get_tx() {
-        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded);
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
         let err = chain.get_tx(&Txid::all_zeros()).unwrap_err();
         assert!(matches!(err, BlockchainError::Unsupported(_)));
     }
 
     #[test]
     fn propagates_unsupported_get_block() {
-        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded);
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
         let err = chain.get_block(&BlockHash::all_zeros()).unwrap_err();
         assert!(matches!(err, BlockchainError::Unsupported(_)));
     }
 
     #[test]
     fn propagates_unsupported_handle_transaction() {
-        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded);
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
         let err = chain.handle_transaction().unwrap_err();
         assert!(matches!(err, BlockchainError::Unsupported(_)));
     }
 
     #[test]
     fn propagates_validation_index_ok() {
-        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded);
+        let chain = setup_test_chain(Network::Regtest, AssumeValidArg::Hardcoded, None);
         // the genesis is FullyValid, so validation index should succeed
         let idx = chain.get_validation_index().unwrap();
         assert_eq!(idx, 0);
