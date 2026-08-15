@@ -107,7 +107,14 @@ impl Display for ChainstoreError {
     }
 }
 
-impl error::Error for ChainstoreError {}
+impl error::Error for ChainstoreError {
+    /// Every variant describes the failure itself: the domain variants carry no inner error,
+    /// and [`Other`](ChainstoreError::Other) deliberately holds a plain diagnostic string
+    /// rather than a boxed error, so there is no source to expose.
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        None
+    }
+}
 
 /// Allows [`ChainstoreError`] to be used as the associated `Error` type of [`ChainStore`]
 impl DatabaseError for ChainstoreError {}
@@ -273,7 +280,7 @@ impl Decodable for DiskBlockHeader {
 }
 
 impl Encodable for DiskBlockHeader {
-    /// Encodes a `DiskBlockHeader` to a writer using the consensus encoding.
+    #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
         writer: &mut W,
@@ -348,6 +355,13 @@ impl BestChain {
 }
 
 impl Encodable for BestChain {
+    // INVARIANT: `len` accumulates the encoded size of one BestChain record. Each addend is
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "len accumulates the encoded size of one BestChain record, where each addend \
+                  is the byte count actually written, so the total is bounded by the record \
+                  size and cannot approach usize::MAX"
+    )]
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
         writer: &mut W,
@@ -380,6 +394,17 @@ impl Decodable for BestChain {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use std::io::Cursor;
 

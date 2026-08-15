@@ -44,6 +44,7 @@ pub struct LeafData {
 impl LeafData {
     pub fn _get_leaf_hashes(&self) -> sha256::Hash {
         let mut ser_utxo = Vec::new();
+        #[allow(clippy::expect_used, reason = "invariant above")]
         self.utxo
             .consensus_encode(&mut ser_utxo)
             .expect("serializing TxOut never fails: Vec<u8>::Write always returns Ok");
@@ -147,6 +148,11 @@ impl Decodable for ScriptPubKeyKind {
 }
 
 impl Encodable for ScriptPubKeyKind {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "len accumulates the encoded size of a single script-pubkey type, whose \
+                  addends are the byte counts actually written, so it cannot approach usize::MAX"
+    )]
     fn consensus_encode<W: bitcoin::io::Write + ?Sized>(
         &self,
         writer: &mut W,
@@ -266,6 +272,8 @@ pub mod proof_util {
         }
     }
 
+    impl core::error::Error for UtreexoLeafError {}
+
     /// This function returns the scriptPubKey type (i.e. address type) of a given script data.
     /// It can be:
     ///
@@ -325,6 +333,11 @@ pub mod proof_util {
     ) -> sha256::Hash {
         // An utreexo leaf hash is computed by hashing the UTXO bytes with some metadata
         let mut ser_utxo = Vec::new();
+        #[allow(
+            clippy::expect_used,
+            reason = "the writer is a Vec<u8>, whose Write impl is infallible, so encoding a TxOut into \
+                      it cannot return Err"
+        )]
         utxo.consensus_encode(&mut ser_utxo)
             .expect("serializing TxOut never fails: Vec<u8>::Write always returns Ok");
 
@@ -555,6 +568,17 @@ pub mod proof_util {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod test {
     use bitcoin::Amount;
     use bitcoin::BlockHash;

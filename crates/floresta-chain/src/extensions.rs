@@ -178,8 +178,10 @@ impl HeaderExt for Header {
     ) -> Result<Option<BlockHash>, HeaderExtError> {
         let height = self.get_height(chain)?;
 
-        // If obtaining the next block hash fails, treat it as "no next block" and return Ok(None)
-        match chain.get_block_hash(height + 1) {
+        #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
+        let next_height = height + 1;
+
+        match chain.get_block_hash(next_height) {
             Ok(opt_hash) => Ok(Some(opt_hash)),
             Err(_) => Ok(None),
         }
@@ -206,7 +208,9 @@ impl HeaderExt for Header {
             .get_height()
             .map_err(|e| HeaderExtError::Chain(Box::new(e)))?;
 
-        Ok(chain_height - height + 1)
+        // A header deeper than the tip has no confirmations; `saturating_sub` keeps that at
+        // zero rather than underflowing, and the tip itself counts as one confirmation.
+        Ok(chain_height.saturating_sub(height).saturating_add(1))
     }
 
     fn get_difficulty(&self) -> f64 {
@@ -293,14 +297,29 @@ impl WorkExt for Work {
         for (word_index, word) in by_chunks.iter().enumerate() {
             // Multiply the word by factor and add carry from previous step
             // Use u64 to avoid overflow during multiplication
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "both operands are widened to u64 before multiplying, and carry_high \
+                          only ever holds the high 32 bits of a previous product, so the \
+                          product plus carry stays within u64"
+            )]
             let product: u64 = (*word as u64) * (factor as u64) + carry_high;
             carry_high = product >> 32;
 
-            // Store the low 32 bits of the product in the result
-            // Result is built in big-endian order, so calculate the index accordingly
-            let byte_index = by_chunks.len() - word_index;
-            result_bytes[(byte_index - 1) * word_size..byte_index * word_size]
-                .copy_from_slice(&(product as u32).to_be_bytes());
+            // Store the low 32 bits of the product in the result. The result is built in
+            // big-endian order, so the index is calculated accordingly.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                clippy::indexing_slicing,
+                reason = "word_index is bounded by by_chunks.len(), so byte_index is in 1..=len \
+                          and both byte_index - 1 and the resulting range are in bounds of \
+                          result_bytes, which holds exactly len * word_size bytes"
+            )]
+            {
+                let byte_index = by_chunks.len() - word_index;
+                result_bytes[(byte_index - 1) * word_size..byte_index * word_size]
+                    .copy_from_slice(&(product as u32).to_be_bytes());
+            }
         }
 
         if carry_high > 0 {
@@ -316,6 +335,17 @@ impl WorkExt for Work {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use core::fmt;
     use core::fmt::Display;

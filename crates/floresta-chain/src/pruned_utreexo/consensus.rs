@@ -122,6 +122,11 @@ impl Consensus {
     /// Returns the amount of block subsidy to be paid in a block, given its height.
     ///
     /// The Bitcoin Core source can be found [here](https://github.com/bitcoin/bitcoin/blob/2b211b41e36f914b8d0487e698b619039cc3c8e2/src/validation.cpp#L1501-L1512).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "subsidy_halving_interval is a NonZeroU32, so the division is defined, and the \
+                  multiplication is over compile-time constants that fit comfortably in u64"
+    )]
     pub fn get_subsidy(&self, height: u32) -> Amount {
         let halvings = height / self.parameters.subsidy_halving_interval.get();
         // Force block reward to zero when right shift is undefined.
@@ -140,6 +145,16 @@ impl Consensus {
     /// # Panics
     ///
     /// Panics if `height` is `u32::MAX`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        reason = "subsidy_halving_interval is a NonZeroU32, so the divisions and modulo are \
+                  defined; blocks_per_epoch * epoch is bounded by the halving interval times \
+                  MAX_SUBSIDY_HALVINGS and total by the 21M BTC supply in satoshis, both far \
+                  below their maxima; the final subtraction cannot underflow because the loop \
+                  above added the genesis subsidy to total, and the expect is the panic \
+                  documented in the # Panics section"
+    )]
     pub fn max_supply_at_height(&self, height: u32) -> Amount {
         let blocks_per_epoch = self.parameters.subsidy_halving_interval.get();
 
@@ -222,7 +237,11 @@ impl Consensus {
             // Fee is the difference between inputs and outputs. In the above function call we have
             // verified that `out_value <= in_value` (no underflow risk).
             fee = fee
-                .checked_add(in_value - out_value)
+                .checked_add(
+                    in_value
+                        .checked_sub(out_value)
+                        .ok_or(BlockValidationErrors::NotEnoughMoney)?,
+                )
                 .ok_or(BlockValidationErrors::TooManyCoins)?;
         }
 
@@ -231,7 +250,10 @@ impl Consensus {
             .checked_add(subsidy)
             .ok_or(BlockValidationErrors::TooManyCoins)?;
 
-        let coinbase_total = Self::total_out_value(&transactions[0])?;
+        let coinbase = transactions
+            .first()
+            .ok_or(BlockValidationErrors::EmptyBlock)?;
+        let coinbase_total = Self::total_out_value(coinbase)?;
 
         if coinbase_total > allowed_reward {
             Err(BlockValidationErrors::BadCoinbaseOutValue)?;
@@ -298,6 +320,7 @@ impl Consensus {
             }
 
             let mut spent_vouts = Vec::new();
+            #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
             for (vout, out) in transaction.output.iter().enumerate() {
                 // Special case: unspendable outputs do not count for the block `output_index`
                 if Self::is_unspendable(&out.script_pubkey) {
@@ -338,6 +361,10 @@ impl Consensus {
             0 => {}
 
             // Only one `OutPoint` to add
+            #[allow(
+                clippy::indexing_slicing,
+                reason = "this arm only matches when spent_vouts.len() == 1"
+            )]
             1 => agg.add(salt, &OutPoint::new(txid, spent_vouts[0])),
 
             // All `OutPoints` to hash here will share the same txid, only differing in the vout.
@@ -393,7 +420,7 @@ impl Consensus {
             let txout = &utxo.txout;
 
             // A coinbase output created at height n can only be spent at height >= n + 100
-            if utxo.is_coinbase && (height < utxo.creation_height + 100) {
+            if utxo.is_coinbase && (height < utxo.creation_height.saturating_add(100)) {
                 Err(tx_err!(txid, CoinbaseNotMatured))?;
             }
 
@@ -445,8 +472,11 @@ impl Consensus {
                 .ok_or_else(|| tx_err!(txid, UtxoNotFound, input.previous_output))?
                 .txout;
 
+            // A satoshi value that does not fit in an i64 is out of range by definition; the
+            // conversion error carries no information beyond that.
             let value = i64::try_from(spent_output.value.to_sat())
-                .map_err(|_| tx_err!(txid, TooManyCoins))?;
+                .ok()
+                .ok_or_else(|| tx_err!(txid, TooManyCoins))?;
             let spk = bitcoinkernel::ScriptPubkey::try_from(spent_output.script_pubkey.as_bytes())
                 .map_err(|e| tx_err!(txid, ScriptValidationError, e.to_string()))?;
 
@@ -483,6 +513,7 @@ impl Consensus {
     fn has_duplicate_inputs(inputs: &[TxIn]) -> bool {
         match inputs.len() {
             1 => false,
+            #[allow(clippy::indexing_slicing, reason = "invariant above")]
             2 => inputs[0].previous_output == inputs[1].previous_output,
             _ => {
                 let mut seen = HashSet::with_capacity(inputs.len());
@@ -735,6 +766,10 @@ impl Consensus {
             Ok(script::Instruction::Op(opcode)) => {
                 let opcode = opcode.to_u8();
                 if (0x51..=0x60).contains(&opcode) {
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "the range check above guarantees opcode >= 0x51"
+                    )]
                     Some(opcode as u32 - 0x50)
                 } else {
                     None
@@ -753,7 +788,7 @@ impl Consensus {
         block: &BlockHeader,
         prev_block: &BlockHeader,
     ) -> Result<(), BlockValidationErrors> {
-        if block.time < (prev_block.time - 600) {
+        if block.time < prev_block.time.saturating_sub(600) {
             return Err(BlockValidationErrors::BIP94TimeWarp);
         }
 
@@ -767,7 +802,10 @@ impl Consensus {
         first_block: &BlockHeader,
         params: ChainParams,
     ) -> Target {
-        let actual_timespan = last_block.time - first_block.time;
+        // Block timestamps are not monotonic, so `last_block` may predate `first_block`.
+        // Bitcoin Core computes this as a signed value and clamps it to the lower bound of
+        // the retarget window; saturating at zero reaches the same clamped result.
+        let actual_timespan = last_block.time.saturating_sub(first_block.time);
         // from bip 94:
         //  a. The base difficulty value MUST be taken from the first block of the previous
         //     difficulty period
@@ -999,6 +1037,17 @@ pub mod swift_sync_agg {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use core::str::FromStr;
     use std::fs::File;
