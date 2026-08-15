@@ -387,7 +387,7 @@ impl BlockIndex {
         // Retrieve the base pointer to the start of the memory-mapped index
         let base_ptr = self.index_map.as_ptr() as *mut Index;
 
-        // Since the size is a power of two `2^k`, subtracting one gives a 0b111...1 k-bit mask
+        #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
         let mask = self.index_size - 1;
 
         for _ in 0..self.index_size {
@@ -553,7 +553,19 @@ impl Default for FlatChainStoreConfig {
 }
 
 impl FlatChainStoreConfig {
-    pub fn new_with_path(path: impl AsRef<Path>) -> Self {
+    /// Creates a configuration for a store at `path`, with every other setting defaulted.
+    ///
+    /// `path` is the only value with no sensible default, which is why it is the sole
+    /// argument. To adjust the rest, start from [`Default`] and override what you need:
+    ///
+    /// ```no_run
+    /// # use floresta_chain::FlatChainStoreConfig;
+    /// let config = FlatChainStoreConfig {
+    ///     cache_size: Some(1_000),
+    ///     ..FlatChainStoreConfig::new("./data/chain")
+    /// };
+    /// ```
+    pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().into(),
             ..Default::default()
@@ -592,15 +604,22 @@ impl FlatChainStore {
         let fork_headers_path = datadir.join("fork_headers.bin");
         let accumulator_file_path = datadir.join("accumulators.bin");
 
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the *_size values are capped at construction so that multiplying by the \
+                      fixed record size stays well inside usize on the 64-bit targets we support"
+        )]
         let index_map_file_size = index_size * size_of::<u32>();
         let index_map = unsafe { Self::init_file(&index_path, index_map_file_size, file_mode)? };
 
+        #[allow(clippy::arithmetic_side_effects, reason = "invariant as above")]
         let headers_file_size = headers_size * size_of::<HashedDiskHeader>();
         let headers = unsafe { Self::init_file(&headers_path, headers_file_size, file_mode)? };
 
         let metadata =
             unsafe { Self::init_file(&metadata_path, size_of::<Metadata>(), file_mode)? };
 
+        #[allow(clippy::arithmetic_side_effects, reason = "invariant as above")]
         let fork_headers_file_size = fork_size * size_of::<HashedDiskHeader>();
         let fork_headers =
             unsafe { Self::init_file(&fork_headers_path, fork_headers_file_size, file_mode)? };
@@ -705,9 +724,16 @@ impl FlatChainStore {
         let fork_file_path = datadir.join("fork_headers.bin");
         let accumulator_file_path = datadir.join("accumulators.bin");
 
-        let index_file_size = metadata.index_capacity * size_of::<u32>();
-        let headers_file_size = metadata.headers_file_size * size_of::<HashedDiskHeader>();
-        let fork_file_size = metadata.fork_file_size * size_of::<HashedDiskHeader>();
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "these capacities were written by new with the same bounds applied, so multiplying \
+                      by the fixed record size stays inside usize"
+        )]
+        let (index_file_size, headers_file_size, fork_file_size) = (
+            metadata.index_capacity * size_of::<u32>(),
+            metadata.headers_file_size * size_of::<HashedDiskHeader>(),
+            metadata.fork_file_size * size_of::<HashedDiskHeader>(),
+        );
 
         let index_map = unsafe { Self::init_file(&index_path, index_file_size, file_mode)? };
         let headers = unsafe { Self::init_file(&headers_file_path, headers_file_size, file_mode)? };
@@ -749,6 +775,7 @@ impl FlatChainStore {
         index: Index,
     ) -> Result<(), ChainstoreError> {
         let metadata = unsafe { self.get_metadata() }?;
+        #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
         let next_occupancy = metadata.block_index_occupancy + 1;
         if next_occupancy >= metadata.index_capacity {
             return Err(ChainstoreError::Other("block index is full".into()));
@@ -815,15 +842,22 @@ impl FlatChainStore {
             return 0;
         }
 
-        n -= 1;
-        n |= n >> 1;
-        n |= n >> 2;
-        n |= n >> 4;
-        n |= n >> 8;
-        n |= n >> 16;
-        n += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "the n == 0 early return above means n >= 1 here, so the decrement cannot \
+                      underflow, and the final increment is guarded by the caller's capacity bound"
+        )]
+        {
+            n -= 1;
+            n |= n >> 1;
+            n |= n >> 2;
+            n |= n >> 4;
+            n |= n >> 8;
+            n |= n >> 16;
+            n += 1;
 
-        n
+            n
+        }
     }
 
     /// Initializes a memory-mapped file with the specified byte size and permissions (mode).
@@ -983,7 +1017,6 @@ impl FlatChainStore {
     unsafe fn get_metadata_mut(&mut self) -> Result<&mut Metadata, ChainstoreError> {
         let ptr = self.metadata.as_ptr() as *mut Metadata;
 
-        // INVARIANT: `MmapMut::as_ptr()` is always non-null for a valid mapping
         #[allow(
             clippy::unwrap_used,
             reason = "MmapMut::as_ptr() is non-null for valid mappings"
@@ -1069,7 +1102,14 @@ impl FlatChainStore {
 
         let index = Index::new_fork(fork_blocks)?;
         unsafe { self.add_index_entry(block_hash, index) }?;
-        unsafe { self.get_metadata_mut() }?.fork_count += 1;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "fork_count tracks stored fork headers, bounded by fork_file_size, which \
+                      is far below u32::MAX"
+        )]
+        {
+            unsafe { self.get_metadata_mut() }?.fork_count += 1;
+        }
 
         Ok(())
     }
@@ -1113,6 +1153,11 @@ impl ChainStore for FlatChainStore {
         let header_size = size_of::<HashedDiskHeader>() as u64;
 
         // Fixed-size record files: compute from bookkeeping.
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "depth and fork_count are u32 widened to u64, and header_size is a small \
+                      constant, so these products and sums stay far inside u64"
+        )]
         let mut total = (u64::from(metadata.depth) + 1) * header_size
             + u64::from(metadata.fork_count) * header_size;
 
@@ -1120,7 +1165,7 @@ impl ChainStore for FlatChainStore {
         for name in ["blocks_index.bin", "metadata.bin", "accumulators.bin"] {
             let path = self.datadir.join(name);
             match fs::metadata(&path) {
-                Ok(meta) => total += meta.len(),
+                Ok(meta) => total = total.saturating_add(meta.len()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     debug!("size_on_disk: {name} not found, skipping");
                 }
