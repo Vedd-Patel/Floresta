@@ -38,6 +38,13 @@ impl fmt::Display for Error {
     }
 }
 
+impl From<floresta_chain::BlockchainError> for Error {
+    /// The canonical wrapping for a chain failure reaching the Electrum layer.
+    fn from(e: floresta_chain::BlockchainError) -> Self {
+        Self::Blockchain(Box::new(e))
+    }
+}
+
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
@@ -55,4 +62,8 @@ impl error::Error for Error {
 impl_error_from!(Error, serde_json::Error, Parsing);
 impl_error_from!(Error, std::io::Error, Io);
 impl_error_from!(Error, oneshot::error::RecvError, NodeHandle);
-impl_error_from!(Error, floresta_watch_only::WatchOnlyError<floresta_watch_only::kv_database::KvDatabaseError>, Wallet);
+impl_error_from!(
+    Error,
+    floresta_watch_only::WatchOnlyError<floresta_watch_only::kv_database::KvDatabaseError>,
+    Wallet
+);

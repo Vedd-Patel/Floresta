@@ -16,6 +16,7 @@ use bitcoin::consensus::deserialize;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::sha256;
+use floresta_chain::BlockchainError;
 use floresta_chain::pruned_utreexo::BlockchainInterface;
 use floresta_common::get_hash_from_u8;
 use floresta_common::get_spk_hash;
@@ -75,7 +76,10 @@ struct TcpActor<S: AsyncStream> {
 }
 
 impl<S: AsyncStream> TcpActor<S> {
-    #[allow(clippy::expect_used, reason = "INVARIANT: unbounded channel failure implies reactor died")]
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: unbounded channel failure implies reactor died"
+    )]
     async fn run(&mut self) {
         let (reader, mut writer) = tokio::io::split(&mut self.stream);
         let mut lines = BufReader::new(reader).lines();
@@ -183,7 +187,7 @@ pub enum Message {
     Disconnect(ClientId),
 }
 
-pub struct ElectrumServer<Blockchain: BlockchainInterface> {
+pub struct ElectrumServer<Blockchain: BlockchainInterface<Error = BlockchainError>> {
     /// The blockchain backend we are using. This will be used to query
     /// blockchain information and broadcast transactions.
     chain: Arc<Blockchain>,
@@ -230,7 +234,7 @@ pub struct ElectrumServer<Blockchain: BlockchainInterface> {
     last_rebroadcast: Option<Instant>,
 }
 
-impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
+impl<Blockchain: BlockchainInterface<Error = BlockchainError>> ElectrumServer<Blockchain> {
     pub fn new(
         address_cache: Arc<AddressCache<KvDatabase>>,
         chain: Arc<Blockchain>,
@@ -269,14 +273,11 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         match request.method.as_str() {
             "blockchain.block.header" => {
                 let height = get_arg!(request, u32, 0);
-                let hash = self
-                    .chain
-                    .get_block_hash(height)
-                    .map_err(|_| super::error::Error::InvalidParams)?;
-                let header = self
-                    .chain
-                    .get_block_header(&hash)
-                    .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
+                let Ok(hash) = self.chain.get_block_hash(height) else {
+                    // No block at that height: a client parameter problem, not a chain fault.
+                    return Err(super::error::Error::InvalidParams);
+                };
+                let header = self.chain.get_block_header(&hash)?;
                 let header = serialize_hex(&header);
                 json_rpc_res!(request, header)
             }
@@ -286,10 +287,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 let start_height = get_arg!(request, u32, 0);
                 let count = get_arg!(request, u32, 1).min(MAX_COUNT);
 
-                let chain_height = self
-                    .chain
-                    .get_height()
-                    .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
+                let chain_height = self.chain.get_height()?;
 
                 let end_height =
                     (chain_height.saturating_add(1)).min(start_height.saturating_add(count));
@@ -311,14 +309,8 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             }
             "blockchain.estimatefee" => json_rpc_res!(request, 0.0001),
             "blockchain.headers.subscribe" => {
-                let (height, hash) = self
-                    .chain
-                    .get_best_block()
-                    .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
-                let header = self
-                    .chain
-                    .get_block_header(&hash)
-                    .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
+                let (height, hash) = self.chain.get_best_block()?;
+                let header = self.chain.get_block_header(&hash)?;
                 let result = json!({
                     "height": height,
                     "hex": serialize_hex(&header)
@@ -505,10 +497,14 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             // end of experimental endpoints
             "blockchain.transaction.broadcast" => {
                 let tx = get_arg!(request, String, 0);
-                let hex: Vec<_> =
-                    Vec::from_hex(&tx).map_err(|_| super::error::Error::InvalidParams)?;
-                let tx: Transaction =
-                    deserialize(&hex).map_err(|_| super::error::Error::InvalidParams)?;
+                // Both failures mean the client sent something that is not a valid raw
+                // transaction, which is exactly what InvalidParams reports.
+                let hex: Vec<_> = Vec::from_hex(&tx)
+                    .ok()
+                    .ok_or(super::error::Error::InvalidParams)?;
+                let tx: Transaction = deserialize(&hex)
+                    .ok()
+                    .ok_or(super::error::Error::InvalidParams)?;
 
                 let txid = tx.compute_txid();
                 if let Err(e) = self
@@ -578,10 +574,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
                 json_rpc_res!(request, "")
             }
             "server.features" => {
-                let genesis_hash = self
-                    .chain
-                    .get_block_hash(0)
-                    .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?;
+                let genesis_hash = self.chain.get_block_hash(0)?;
                 let res = json!(
                     {
                         "genesis_hash": genesis_hash,
@@ -735,8 +728,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
 
             let height = self
                 .chain
-                .get_block_height(&block.block_hash())
-                .map_err(|e| super::error::Error::Blockchain(Box::new(e)))?
+                .get_block_height(&block.block_hash())?
                 .unwrap_or(0);
 
             if let Err(e) = self.handle_block(block, height) {
@@ -792,7 +784,7 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
             }
         }
 
-        if self.chain.get_height().map_err(|e| super::error::Error::Blockchain(Box::new(e)))? == height {
+        if self.chain.get_height()? == height {
             for client in &mut self.clients.values() {
                 try_and_log!(client.write(serde_json::to_string(&result)?.as_bytes()));
             }
@@ -893,7 +885,10 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
         Ok(())
     }
 
-    fn wallet_notify(&self, transactions: &[(Transaction, TxOut)]) -> Result<(), crate::error::Error> {
+    fn wallet_notify(
+        &self,
+        transactions: &[(Transaction, TxOut)],
+    ) -> Result<(), crate::error::Error> {
         for (_, out) in transactions {
             let hash = get_spk_hash(&out.script_pubkey);
             if let Some(client) = self.client_addresses.get(&hash) {
@@ -921,7 +916,10 @@ impl<Blockchain: BlockchainInterface> ElectrumServer<Blockchain> {
 }
 
 /// Listens to new TCP connections in a loop
-#[allow(clippy::expect_used, reason = "INVARIANT: unbounded channel failure implies reactor died")]
+#[allow(
+    clippy::expect_used,
+    reason = "INVARIANT: unbounded channel failure implies reactor died"
+)]
 pub async fn client_accept_loop(
     listener: Arc<TcpListener>,
     message_transmitter: UnboundedSender<Message>,
@@ -943,7 +941,7 @@ pub async fn client_accept_loop(
                         message_transmitter
                             .send(Message::NewClient((client.client_id, client)))
                             .expect("BUG: Main loop is broken");
-                        id_count += 1;
+                        id_count = id_count.saturating_add(1);
                     }
                     Err(e) => {
                         error!("TLS accept error: {e:?}");
@@ -954,7 +952,7 @@ pub async fn client_accept_loop(
                 message_transmitter
                     .send(Message::NewClient((client.client_id, client)))
                     .expect("BUG: Main loop is broken");
-                id_count += 1;
+                id_count = id_count.saturating_add(1);
             }
         }
     }
@@ -1026,8 +1024,18 @@ macro_rules! get_arg {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod test {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use core::str::FromStr;
     use std::io;
     use std::sync::Arc;
@@ -1043,6 +1051,7 @@ mod test {
     use bitcoin::hashes::hex::FromHex;
     use bitcoin::hashes::sha256;
     use floresta_chain::AssumeValidArg;
+    use floresta_chain::BlockchainError;
     use floresta_chain::ChainState;
     use floresta_chain::FlatChainStore;
     use floresta_chain::FlatChainStoreConfig;
@@ -1112,23 +1121,70 @@ mod test {
         headers
     }
 
+    /// A chain failure reaching the Electrum layer is wrapped at this module's boundary,
+    /// so a caller can tell a chain fault from a client protocol error, and can still walk
+    /// back to what the chain actually reported.
+    #[test]
+    fn propagates_blockchain_error_with_source() {
+        use core::error::Error as _;
+
+        let err = super::super::error::Error::from(BlockchainError::BlockNotPresent);
+
+        assert!(matches!(err, super::super::error::Error::Blockchain(_)));
+        assert!(
+            err.source().is_some(),
+            "the chain error must remain reachable through the source chain"
+        );
+        assert_eq!(
+            err.source().unwrap().to_string(),
+            BlockchainError::BlockNotPresent.to_string()
+        );
+    }
+
+    /// A malformed JSON payload from a client is a parse failure, kept distinct from a
+    /// protocol-level bad-parameter error so the client can tell the two apart.
+    #[test]
+    fn propagates_parsing_error_with_source() {
+        use core::error::Error as _;
+
+        let serde_err = serde_json::from_str::<Value>("{not json").unwrap_err();
+        let err = super::super::error::Error::from(serde_err);
+
+        assert!(matches!(err, super::super::error::Error::Parsing(_)));
+        assert!(err.source().is_some());
+    }
+
+    /// Errors that describe a client mistake carry no inner cause, so `source` is `None`
+    /// rather than pointing at something unrelated.
+    #[test]
+    fn invalid_params_has_no_source() {
+        use core::error::Error as _;
+
+        let err = super::super::error::Error::InvalidParams;
+
+        assert!(err.source().is_none());
+        assert!(!err.to_string().is_empty());
+    }
+
     fn get_test_cache() -> Arc<AddressCache<KvDatabase>> {
         let test_id: u32 = rand::random();
         let cache = KvDatabase::new(format!("./tmp-db/{test_id}.floresta")).unwrap();
-        let cache = AddressCache::new(cache);
+        let cache = AddressCache::new(cache).unwrap();
 
         // Inserting test transactions in the wallet
         let (transaction, proof) = get_test_transaction();
-        cache.cache_transaction(
-            &transaction,
-            118511,
-            transaction.output[0].value.to_sat(),
-            proof,
-            1,
-            0,
-            false,
-            get_spk_hash(&transaction.output[0].script_pubkey),
-        );
+        cache
+            .cache_transaction(
+                &transaction,
+                118511,
+                transaction.output[0].value.to_sat(),
+                proof,
+                1,
+                0,
+                false,
+                get_spk_hash(&transaction.output[0].script_pubkey),
+            )
+            .unwrap();
 
         Arc::new(cache)
     }
@@ -1153,9 +1209,12 @@ mod test {
         let mut line = String::new();
         let timeout_duration = Duration::from_secs(10);
 
+        // `tokio::time::error::Elapsed` carries no detail beyond "the timeout fired", which
+        // is what the TimedOut kind already says.
         let len = timeout(timeout_duration, reader.read_line(&mut line))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Timeout occurred"))??;
+            .ok()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "Timeout occurred"))??;
 
         if len == 0 {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "No data read"));
