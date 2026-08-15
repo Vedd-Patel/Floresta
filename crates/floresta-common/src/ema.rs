@@ -27,15 +27,29 @@ pub struct Ema {
     value: Option<f64>,
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "50 is a non-zero literal evaluated in const context, so a None here is a \
+              compile-time error rather than a runtime panic"
+)]
+const HALF_LIFE_50: NonZeroU16 = NonZeroU16::new(50).expect("50 is non-zero");
+
+#[allow(
+    clippy::expect_used,
+    reason = "1000 is a non-zero literal evaluated in const context, so a None here is a \
+              compile-time error rather than a runtime panic"
+)]
+const HALF_LIFE_1000: NonZeroU16 = NonZeroU16::new(1_000).expect("1000 is non-zero");
+
 impl Ema {
     /// EMA preset: half-life 50 samples (good default for peer message latency).
     pub fn with_half_life_50() -> Self {
-        Self::from_half_life(NonZeroU16::new(50).expect("non-zero"))
+        Self::from_half_life(HALF_LIFE_50)
     }
 
     /// EMA preset: half-life 1000 samples (low noise, good for e.g., block validation time).
     pub fn with_half_life_1000() -> Self {
-        Self::from_half_life(NonZeroU16::new(1_000).expect("non-zero"))
+        Self::from_half_life(HALF_LIFE_1000)
     }
 
     /// Constructs an EMA from a half-life measured in samples.
@@ -76,6 +90,13 @@ impl Ema {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use super::*;
 

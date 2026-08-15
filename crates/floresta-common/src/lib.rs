@@ -62,7 +62,10 @@ pub fn get_spk_hash(spk: &ScriptBuf) -> sha256::Hash {
 
 /// Reads a VarInt from the given reader and ensures it is less than or equal to `max`.
 ///
-/// Returns an error if the VarInt is larger than `max`.
+/// # Errors
+///
+/// Returns [`encode::Error::OversizedVectorAllocation`] if the decoded VarInt is larger
+/// than `max`, or whichever [`encode::Error`] the underlying VarInt decode produced.
 pub fn read_bounded_len<R: bitcoin::io::Read + ?Sized>(
     reader: &mut R,
     max: usize,
@@ -202,6 +205,13 @@ pub mod prelude {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use bitcoin::Network;
     use bitcoin::ScriptBuf;
