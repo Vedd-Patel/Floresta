@@ -32,7 +32,7 @@ struct Inner {
 /// Errors related to the [`MemoryDatabase`].
 pub enum MemoryDatabaseError {
     /// The lock is poisoned.
-    PoisonedLock,
+    PoisonedLock(String),
 }
 
 #[derive(Debug, Default)]
@@ -43,10 +43,18 @@ pub struct MemoryDatabase {
 
 type Result<T> = floresta_common::prelude::Result<T, MemoryDatabaseError>;
 
+impl core::error::Error for MemoryDatabaseError {
+    /// [`PoisonedLock`](MemoryDatabaseError::PoisonedLock) carries the poison message as a
+    /// plain string rather than a boxed error, so there is no source to expose.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        None
+    }
+}
+
 impl Display for MemoryDatabaseError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PoisonedLock => write!(f, "Poisoned lock"),
+            Self::PoisonedLock(e) => write!(f, "Poisoned lock: {e}"),
         }
     }
 }
@@ -61,16 +69,18 @@ impl MemoryDatabase {
 
     /// Get the [`MemoryDatabase`]'s [`Inner`] for read operations.
     fn get_inner(&self) -> Result<sync::RwLockReadGuard<'_, Inner>> {
-        self.inner
-            .read()
-            .map_err(|_| MemoryDatabaseError::PoisonedLock)
+        match self.inner.read() {
+            Ok(guard) => Ok(guard),
+            Err(e) => Err(MemoryDatabaseError::PoisonedLock(e.to_string())),
+        }
     }
 
     /// Get the [`MemoryDatabase`]'s [`Inner`] for write operations.
     fn get_inner_mut(&self) -> Result<sync::RwLockWriteGuard<'_, Inner>> {
-        self.inner
-            .write()
-            .map_err(|_| MemoryDatabaseError::PoisonedLock)
+        match self.inner.write() {
+            Ok(guard) => Ok(guard),
+            Err(e) => Err(MemoryDatabaseError::PoisonedLock(e.to_string())),
+        }
     }
 }
 
@@ -152,5 +162,65 @@ impl AddressCacheDatabase for MemoryDatabase {
             inner.stats.clone_from(stats);
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
+mod test {
+    use std::sync::Arc;
+
+    use super::MemoryDatabase;
+    use super::MemoryDatabaseError;
+    use crate::AddressCacheDatabase;
+
+    /// A thread panicking while holding the lock poisons it for everyone after. Every
+    /// database read must then report [`MemoryDatabaseError::PoisonedLock`] carrying the
+    /// poison message, rather than discarding it or panicking a second time.
+    #[test]
+    fn propagates_poisoned_lock_with_message() {
+        let db = Arc::new(MemoryDatabase::new());
+        let poisoner = Arc::clone(&db);
+
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.inner.write().unwrap();
+            panic!("poisoning the lock on purpose");
+        });
+        assert!(handle.join().is_err());
+
+        let err = db.load().unwrap_err();
+        assert!(matches!(err, MemoryDatabaseError::PoisonedLock(_)));
+
+        let MemoryDatabaseError::PoisonedLock(message) = err;
+        assert!(
+            !message.is_empty(),
+            "the poison message must be kept for diagnostics"
+        );
+    }
+
+    /// Writes go through the same conversion, so they report the same variant.
+    #[test]
+    fn propagates_poisoned_lock_on_write() {
+        let db = Arc::new(MemoryDatabase::new());
+        let poisoner = Arc::clone(&db);
+
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.inner.write().unwrap();
+            panic!("poisoning the lock on purpose");
+        });
+        assert!(handle.join().is_err());
+
+        let err = db.set_cache_height(1).unwrap_err();
+        assert!(matches!(err, MemoryDatabaseError::PoisonedLock(_)));
     }
 }
