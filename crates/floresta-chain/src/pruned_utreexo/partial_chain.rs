@@ -123,8 +123,12 @@ impl PartialChainStateInner {
     #[inline]
     /// Returns the ancestor for a given block header
     fn get_ancestor(&self, height: u32) -> Result<BlockHeader, BlockchainError> {
+        let parent_height = height
+            .checked_sub(1)
+            .ok_or(BlockchainError::BlockNotPresent)?;
+
         let prev = self
-            .get_block(height - 1)
+            .get_block(parent_height)
             .ok_or(BlockchainError::BlockNotPresent)?;
 
         Ok(*prev)
@@ -137,9 +141,11 @@ impl PartialChainStateInner {
         let mut current_height = height;
 
         header.median_time_past_with(|_| {
+            // INVARIANT: `median_time_past_with` short-circuits once it reaches genesis,
+            // so it never asks for the parent of height 0 and the subtraction is defined.
             current_height = current_height
                 .checked_sub(1)
-                .expect("height 0 must be genesis and short-circuit MTP computation");
+                .ok_or(BlockchainError::BlockNotPresent)?;
 
             self.get_block(current_height)
                 .copied()
@@ -160,6 +166,7 @@ impl PartialChainStateInner {
         inputs: HashMap<bitcoin::OutPoint, UtxoData>,
         del_hashes: Vec<bitcoin::hashes::sha256::Hash>,
     ) -> Result<u32, BlockchainError> {
+        #[allow(clippy::arithmetic_side_effects, reason = "invariant above")]
         let height = self.current_height + 1;
 
         if let Err(BlockchainError::BlockValidation(e)) = self.validate_block(block, height, inputs)
@@ -246,6 +253,11 @@ impl PartialChainState {
     #[inline(always)]
     #[must_use]
     #[doc(hidden)]
+    #[allow(
+        clippy::expect_used,
+        reason = "the only way to obtain a PartialChainState is through our own APIs, which \
+                  always initialise the UnsafeCell, so this pointer is never null"
+    )]
     fn inner(&self) -> &PartialChainStateInner {
         unsafe { self.0.get().as_ref().expect("this pointer is valid") }
     }
@@ -262,6 +274,10 @@ impl PartialChainState {
     #[allow(clippy::mut_from_ref)]
     #[must_use]
     #[doc(hidden)]
+    #[allow(
+        clippy::expect_used,
+        reason = "as in inner, the UnsafeCell is always initialised by our own APIs"
+    )]
     fn inner_mut(&self) -> &mut PartialChainStateInner {
         unsafe { self.0.get().as_mut().expect("this pointer is valid") }
     }
@@ -318,14 +334,18 @@ impl UpdatableChainstate for PartialChainState {
         // anything
     }
 
-    // these are unimplemented, and will panic if called
+    // these operations don't apply to a partial chain, and report Unsupported if called
 
     fn accept_header(&self, _header: BlockHeader) -> Result<(), BlockchainError> {
-        unimplemented!("partialChainState shouldn't be used to accept new headers")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState cannot accept new headers",
+        ))
     }
 
     fn switch_chain(&self, _new_tip: BlockHash) -> Result<(), BlockchainError> {
-        unimplemented!("partialChainState shouldn't be used to switch chains")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState cannot switch chains",
+        ))
     }
 
     fn get_partial_chain(
@@ -334,25 +354,33 @@ impl UpdatableChainstate for PartialChainState {
         _final_height: u32,
         _acc: Stump,
     ) -> Result<PartialChainState, BlockchainError> {
-        unimplemented!("We are a partial chain")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState cannot derive another partial chain",
+        ))
     }
 
     fn invalidate_block(&self, _block: BlockHash) -> Result<(), BlockchainError> {
-        unimplemented!(
-            "we know if a block is invalid, just break out of your loop and use the is_valid() method"
-        )
+        Err(BlockchainError::Unsupported(
+            "PartialChainState cannot invalidate blocks; use is_valid() instead",
+        ))
     }
 
     fn handle_transaction(&self) -> Result<(), BlockchainError> {
-        unimplemented!("we don't do transactions")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState does not handle transactions",
+        ))
     }
 
     fn mark_chain_as_assumed(&self, _acc: Stump, _tip: BlockHash) -> Result<bool, BlockchainError> {
-        unimplemented!("no need to mark as valid")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState does not track chain validity",
+        ))
     }
 
     fn mark_block_as_valid(&self, _block: BlockHash) -> Result<(), BlockchainError> {
-        unimplemented!("no need to mark as valid")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState does not track chain validity",
+        ))
     }
 }
 
@@ -372,7 +400,9 @@ impl BlockchainInterface for PartialChainState {
     }
 
     fn size_on_disk(&self) -> Result<u64, Self::Error> {
-        unimplemented!("partialChainState has no on-disk presence")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState has no on-disk presence",
+        ))
     }
 
     fn get_height(&self) -> Result<u32, Self::Error> {
@@ -402,7 +432,7 @@ impl BlockchainInterface for PartialChainState {
         let current_height = self.inner().current_height;
         let coinbase_maturity = self.inner().chain_params().coinbase_maturity;
 
-        Ok(height + coinbase_maturity > current_height)
+        Ok(height.saturating_add(coinbase_maturity) > current_height)
     }
 
     fn get_validation_index(&self) -> Result<u32, Self::Error> {
@@ -415,13 +445,13 @@ impl BlockchainInterface for PartialChainState {
 
     fn get_block_locator(&self) -> Result<Vec<bitcoin::BlockHash>, Self::Error> {
         let mut hashes = vec![];
-        let mut step = 1;
+        let mut step: u32 = 1;
         let mut height = self.inner().current_height;
 
         while height > 0 {
             hashes.push(self.get_block_hash(height)?);
             if hashes.len() > 10 {
-                step *= 2;
+                step = step.saturating_mul(2);
             }
             height = height.saturating_sub(step);
         }
@@ -432,11 +462,15 @@ impl BlockchainInterface for PartialChainState {
     // partial chain states are only used for IBD, so we don't need to implement these
 
     fn get_block_header(&self, _height: &BlockHash) -> Result<BlockHeader, Self::Error> {
-        unimplemented!("PartialChainState::get_block_header")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState::get_block_header",
+        ))
     }
 
     fn get_chain_tips(&self) -> Result<Vec<BlockHash>, Self::Error> {
-        unimplemented!("PartialChainState::get_chain_tips")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState::get_chain_tips",
+        ))
     }
 
     fn validate_block(
@@ -447,11 +481,15 @@ impl BlockchainInterface for PartialChainState {
         _del_hashes: Vec<bitcoin::hashes::sha256::Hash>,
         _acc: Stump,
     ) -> Result<(), Self::Error> {
-        unimplemented!("PartialChainState::validate_block")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState::validate_block",
+        ))
     }
 
     fn get_fork_point(&self, _block: BlockHash) -> Result<BlockHash, Self::Error> {
-        unimplemented!("PartialChainState::get_fork_point")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState::get_fork_point",
+        ))
     }
 
     fn update_acc(
@@ -462,38 +500,57 @@ impl BlockchainInterface for PartialChainState {
         _proof: rustreexo::proof::Proof,
         _del_hashes: Vec<bitcoin::hashes::sha256::Hash>,
     ) -> Result<Stump, Self::Error> {
-        unimplemented!("PartialChainState::update_acc")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState::update_acc",
+        ))
     }
 
     fn get_block_locator_for_tip(
         &self,
         _tip: BlockHash,
     ) -> Result<Vec<BlockHash>, BlockchainError> {
-        unimplemented!("PartialChainState::get_block_locator_for_tip")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState::get_block_locator_for_tip",
+        ))
     }
 
     fn get_block(&self, _hash: &bitcoin::BlockHash) -> Result<bitcoin::Block, Self::Error> {
-        unimplemented!("PartialChainState::get_block")
+        Err(BlockchainError::Unsupported("PartialChainState::get_block"))
     }
 
     fn get_tx(&self, _txid: &bitcoin::Txid) -> Result<Option<bitcoin::Transaction>, Self::Error> {
-        unimplemented!("partialChainState::get_tx")
+        Err(BlockchainError::Unsupported("PartialChainState::get_tx"))
     }
 
+    /// # Panics
+    ///
+    /// Always. A [`PartialChainState`] is only ever used for IBD and never emits block
+    /// notifications, so subscribing to one is a programming error rather than a
+    /// recoverable condition. Unlike the other unsupported operations on this type, this
+    /// method returns `()` and so has no way to report the failure to the caller.
+    #[allow(
+        clippy::unimplemented,
+        reason = "returns (), so the Unsupported variant cannot be surfaced; a caller \
+                  reaching here is a bug"
+    )]
     fn subscribe(&self, _tx: sync::Arc<dyn crate::BlockConsumer>) {
-        unimplemented!("partialChainState::subscribe")
+        unimplemented!("PartialChainState::subscribe")
     }
 
     fn estimate_fee(&self, _target: usize) -> Result<f64, Self::Error> {
-        unimplemented!("partialChainState::estimate_fee")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState::estimate_fee",
+        ))
     }
 
     fn get_block_height(&self, _hash: &bitcoin::BlockHash) -> Result<Option<u32>, Self::Error> {
-        unimplemented!("partialChainState::get_block_height")
+        Err(BlockchainError::Unsupported(
+            "PartialChainState::get_block_height",
+        ))
     }
 
     fn get_work(&self, _tip: BlockHash) -> Result<bitcoin::Work, Self::Error> {
-        unimplemented!()
+        Err(BlockchainError::Unsupported("PartialChainState::get_work"))
     }
 }
 
@@ -505,16 +562,29 @@ impl From<PartialChainStateInner> for PartialChainState {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod tests {
     use std::collections::HashMap;
 
     use bitcoin::Block;
     use bitcoin::CompactTarget;
     use bitcoin::Network;
+    use bitcoin::Txid;
     use bitcoin::block::Header;
     use bitcoin::block::Version;
     use bitcoin::consensus::encode::deserialize_hex;
     use bitcoin::constants::genesis_block;
+    use bitcoin::hashes::Hash;
     use floresta_common::acchashes;
     use rustreexo::node_hash::BitcoinNodeHash;
     use rustreexo::proof::Proof;
@@ -522,6 +592,7 @@ mod tests {
 
     use super::PartialChainState;
     use crate::BlockchainError;
+    use crate::pruned_utreexo::BlockchainInterface;
     use crate::pruned_utreexo::UpdatableChainstate;
     use crate::pruned_utreexo::chainparams::ChainParams;
     use crate::pruned_utreexo::consensus::Consensus;
@@ -571,6 +642,109 @@ mod tests {
             error: None,
         }
         .into()
+    }
+
+    /// Operations that don't apply to a partial chain report [`BlockchainError::Unsupported`]
+    /// rather than panicking, so a caller can branch on them.
+    #[test]
+    fn propagates_unsupported_updatable_chainstate_ops() {
+        let chain = get_empty_pchain(vec![genesis_block(Network::Regtest).header]);
+        let dummy = genesis_block(Network::Regtest).block_hash();
+
+        assert!(matches!(
+            chain.accept_header(genesis_block(Network::Regtest).header),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.switch_chain(dummy),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.get_partial_chain(0, 1, Stump::default()),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.invalidate_block(dummy),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.handle_transaction(),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.mark_chain_as_assumed(Stump::default(), dummy),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.mark_block_as_valid(dummy),
+            Err(BlockchainError::Unsupported(_))
+        ));
+    }
+
+    /// The same contract holds for the read-only side of the interface.
+    #[test]
+    fn propagates_unsupported_blockchain_interface_ops() {
+        let chain = get_empty_pchain(vec![genesis_block(Network::Regtest).header]);
+        let dummy = genesis_block(Network::Regtest).block_hash();
+
+        assert!(matches!(
+            chain.size_on_disk(),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.get_block_header(&dummy),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.get_chain_tips(),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.get_fork_point(dummy),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.get_block(&dummy),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.get_tx(&Txid::all_zeros()),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.estimate_fee(1),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.get_block_height(&dummy),
+            Err(BlockchainError::Unsupported(_))
+        ));
+        assert!(matches!(
+            chain.get_work(dummy),
+            Err(BlockchainError::Unsupported(_))
+        ));
+    }
+
+    /// `get_ancestor` at genesis has no parent to return, and must say so instead of
+    /// underflowing the height.
+    #[test]
+    fn propagates_block_not_present_for_genesis_ancestor() {
+        let inner = PartialChainStateInner {
+            assume_valid: true,
+            consensus: Consensus {
+                parameters: ChainParams::from(Network::Regtest),
+            },
+            current_height: 0,
+            current_acc: Stump::default(),
+            final_height: 1,
+            blocks: vec![genesis_block(Network::Regtest).header],
+            error: None,
+        };
+
+        assert!(matches!(
+            inner.get_ancestor(0),
+            Err(BlockchainError::BlockNotPresent)
+        ));
     }
 
     fn test_pchain_inner_with_times(times: &[u32]) -> PartialChainStateInner {
