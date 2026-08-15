@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::read_to_string;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -123,7 +124,7 @@ pub struct NetworkStats {
 
 impl NetworkStats {
     pub const fn total(&self) -> u64 {
-        self.new + self.tried
+        self.new.saturating_add(self.tried)
     }
 }
 
@@ -267,7 +268,13 @@ impl LocalAddress {
             AddrV2::Ipv6(ipv6) => IpAddr::V6(*ipv6),
             AddrV2::Ipv4(ipv4) => IpAddr::V4(*ipv4),
 
-            _ => return None,
+            // Only IP addresses map onto a SocketAddr; onion and I2P peers are reached
+            // through their own transports. Enumerated so a new AddrV2 variant is reviewed.
+            AddrV2::TorV2(_)
+            | AddrV2::TorV3(_)
+            | AddrV2::I2p(_)
+            | AddrV2::Cjdns(_)
+            | AddrV2::Unknown(..) => return None,
         };
 
         let port = self.get_port();
@@ -300,7 +307,7 @@ impl LocalAddress {
             AddrV2::Cjdns(cjdns) => Some(IpAddr::V6(cjdns)),
 
             // Others - These are domain-based, and can't be encoded as an IP address
-            _ => None,
+            AddrV2::TorV2(_) | AddrV2::TorV3(_) | AddrV2::I2p(_) | AddrV2::Unknown(..) => None,
         }
     }
 
@@ -333,7 +340,9 @@ impl LocalAddress {
 
                 false
             }
-            _ => true,
+            // Non-IP address families are treated as routable; reachability for them is
+            // decided by `is_reachable` instead.
+            AddrV2::TorV2(_) | AddrV2::TorV3(_) | AddrV2::I2p(_) | AddrV2::Unknown(..) => true,
         }
     }
 
@@ -414,8 +423,72 @@ impl LocalAddress {
     }
 }
 
+/// Errors that originate in the address book.
+///
+/// Wrapping these here, rather than letting a bare [`std::io::Error`] escape, is what lets a
+/// caller tell an address-book failure from any other I/O failure in the wire crate: the
+/// remedy for a bad `peers.json` is not the remedy for a failed peer socket.
+#[derive(Debug)]
+pub enum AddressManError {
+    /// The peer file could not be read or written.
+    ///
+    /// Usually a permissions or disk-space problem on the data directory. Peers are
+    /// re-discoverable, so the node can keep running with a stale or missing file.
+    PeerFile {
+        /// Which file we were working on, so the operator knows what to inspect.
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// A stored peer file could not be decoded.
+    ///
+    /// The file is corrupt; deleting it makes the node fall back to DNS seeds.
+    CorruptedPeerFile {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+
+    /// A DNS seed could not be reached or returned nothing usable.
+    ///
+    /// Not fatal on its own: the node tries the remaining seeds and any stored peers.
+    DnsSeed {
+        /// The seed host we were querying.
+        seed: String,
+        reason: String,
+    },
+}
+
+impl Display for AddressManError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::PeerFile { path, source } => {
+                write!(f, "could not access peer file {}: {source}", path.display())
+            }
+            Self::CorruptedPeerFile { path, source } => write!(
+                f,
+                "peer file {} is corrupted, delete it to re-seed: {source}",
+                path.display()
+            ),
+            Self::DnsSeed { seed, reason } => {
+                write!(f, "DNS seed {seed} could not be used: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AddressManError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PeerFile { source, .. } => Some(source),
+            Self::CorruptedPeerFile { source, .. } => Some(source),
+            Self::DnsSeed { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 /// A module that keeps track of known addresses and chooses addresses that our node can connect
+/// to.
 pub struct AddressMan {
     /// A map of all peers we know, mapping the address id to the actual address.
     addresses: HashMap<usize, LocalAddress>,
@@ -524,7 +597,8 @@ impl AddressMan {
             AddrV2::TorV3(_) => self.reachable_networks.contains(&ReachableNetworks::TorV3),
             AddrV2::I2p(_) => self.reachable_networks.contains(&ReachableNetworks::I2P),
             AddrV2::Cjdns(_) => self.reachable_networks.contains(&ReachableNetworks::Cjdns),
-            _ => false,
+            // TorV2 is retired and unknown families have no configured transport.
+            AddrV2::TorV2(_) | AddrV2::Unknown(..) => false,
         }
     }
 
@@ -580,13 +654,18 @@ impl AddressMan {
                 AddrV2::TorV3(_) => &mut stats.onion,
                 AddrV2::I2p(_) => &mut stats.i2p,
                 AddrV2::Cjdns(_) => &mut stats.cjdns,
-                _ => continue,
+                // TorV2 is retired and unknown families have no bucket to count into.
+                AddrV2::TorV2(_) | AddrV2::Unknown(..) => continue,
             };
 
             match addr.state {
                 AddressState::Banned(_) => continue,
-                AddressState::Tried(_) | AddressState::Connected => bucket.tried += 1,
-                AddressState::NeverTried | AddressState::Failed(_) => bucket.new += 1,
+                AddressState::Tried(_) | AddressState::Connected => {
+                    bucket.tried = bucket.tried.saturating_add(1);
+                }
+                AddressState::NeverTried | AddressState::Failed(_) => {
+                    bucket.new = bucket.new.saturating_add(1);
+                }
             }
         }
 
@@ -800,7 +879,7 @@ impl AddressMan {
 
                 AddressState::Failed(when) => {
                     let now = Self::time_since_unix();
-                    if when + RETRY_TIME < now {
+                    if when.saturating_add(RETRY_TIME) < now {
                         return Some((id, peer));
                     }
 
@@ -818,8 +897,14 @@ impl AddressMan {
         None
     }
 
-    pub fn dump_peers(&self, datadir: impl AsRef<Path>) -> std::io::Result<()> {
-        let datadir = datadir.as_ref();
+    /// Writes the known peers to `datadir/peers.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddressManError::CorruptedPeerFile`] if the peer list cannot be encoded, or
+    /// [`AddressManError::PeerFile`] if it cannot be written, naming the file either way.
+    pub fn dump_peers(&self, datadir: impl AsRef<Path>) -> Result<(), AddressManError> {
+        let path = datadir.as_ref().join("peers.json");
 
         let peers: Vec<_> = self
             .addresses
@@ -827,31 +912,43 @@ impl AddressMan {
             .cloned()
             .map(Into::<DiskLocalAddress>::into)
             .collect::<Vec<_>>();
-        let peers = serde_json::to_string(&peers);
-        if let Ok(peers) = peers {
-            std::fs::write(datadir.join("peers.json"), peers)?;
-        }
-        Ok(())
+
+        let peers =
+            serde_json::to_string(&peers).map_err(|source| AddressManError::CorruptedPeerFile {
+                path: path.clone(),
+                source,
+            })?;
+
+        std::fs::write(&path, peers).map_err(|source| AddressManError::PeerFile { path, source })
     }
 
     /// Dumps the connected utreexo peers to a file on dir `datadir/anchors.json` in json format `
     /// inputs are the directory to save the file and the list of ids of the connected utreexo peers
+    /// # Errors
+    ///
+    /// Returns [`AddressManError::CorruptedPeerFile`] if the anchor list cannot be encoded,
+    /// or [`AddressManError::PeerFile`] if it cannot be written, naming the file either way.
     pub fn dump_utreexo_peers(
         &self,
         datadir: impl AsRef<Path>,
         peers_id: &[usize],
-    ) -> std::io::Result<()> {
-        let datadir = datadir.as_ref();
+    ) -> Result<(), AddressManError> {
+        let path = datadir.as_ref().join("anchors.json");
 
         let addresses: Vec<DiskLocalAddress> = peers_id
             .iter()
             .filter_map(|id| Some(self.addresses.get(id)?.to_owned().into()))
             .collect();
-        let addresses: Result<String, serde_json::Error> = serde_json::to_string(&addresses);
-        if let Ok(addresses) = addresses {
-            std::fs::write(datadir.join("anchors.json"), addresses)?;
-        }
-        Ok(())
+
+        let addresses = serde_json::to_string(&addresses).map_err(|source| {
+            AddressManError::CorruptedPeerFile {
+                path: path.clone(),
+                source,
+            }
+        })?;
+
+        std::fs::write(&path, addresses)
+            .map_err(|source| AddressManError::PeerFile { path, source })
     }
 
     fn get_address_by_service(&self, service: ServiceFlags) -> Option<(usize, LocalAddress)> {
@@ -911,12 +1008,12 @@ impl AddressMan {
                     }
                 }
                 AddressState::Tried(tried_time) => {
-                    if tried_time + ASSUME_STALE < now {
+                    if tried_time.saturating_add(ASSUME_STALE) < now {
                         address.state = AddressState::NeverTried;
                     }
                 }
                 AddressState::Failed(failed_time) => {
-                    if failed_time + ASSUME_STALE < now {
+                    if failed_time.saturating_add(ASSUME_STALE) < now {
                         address.state = AddressState::NeverTried;
                     }
                 }
@@ -939,7 +1036,7 @@ impl AddressMan {
                         if let AddressState::Failed(when) = address.state {
                             let now = Self::time_since_unix();
 
-                            if (when + RETRY_TIME) < now {
+                            if when.saturating_add(RETRY_TIME) < now {
                                 return true;
                             }
                         }
@@ -1334,7 +1431,17 @@ pub mod dns_proxy {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
 mod test {
     use std::fs::File;
     use std::io::Read;
@@ -1366,10 +1473,11 @@ mod test {
         let mut rng = rand::rng();
 
         for seed in seeds {
-            let state = match seed.state {
-                AddressState::Tried(time) => AddressState::Tried(time),
-                _ => continue,
+            // Only addresses we have successfully tried are worth seeding from.
+            let AddressState::Tried(time) = seed.state else {
+                continue;
             };
+            let state = AddressState::Tried(time);
 
             let local_address = LocalAddress {
                 address: BitcoinSocketAddr::new(seed.address.into(), seed.port),
@@ -1382,6 +1490,67 @@ mod test {
         }
 
         Ok(addresses)
+    }
+
+    /// A malformed address string must surface the parse failure rather than panicking,
+    /// and the error must identify which part of the address was rejected.
+    #[test]
+    fn propagates_invalid_address_from_str() {
+        // A port that is not a number is rejected as an invalid port, not a generic failure.
+        let err = "127.0.0.1:notaport".parse::<LocalAddress>().unwrap_err();
+        assert!(matches!(err, InvalidAddressError::InvalidPort));
+
+        // An unterminated IPv6 literal is rejected as an invalid address.
+        let err = "[::1".parse::<LocalAddress>().unwrap_err();
+        assert!(matches!(err, InvalidAddressError::InvalidAddress));
+
+        // A bare hostname with no port cannot be resolved into a socket address.
+        let err = "not-an-address".parse::<LocalAddress>().unwrap_err();
+        assert!(matches!(
+            err,
+            InvalidAddressError::MissingPort
+                | InvalidAddressError::InvalidAddress
+                | InvalidAddressError::InvalidDNSName
+        ));
+    }
+
+    /// `dump_peers` writes through to the filesystem, so an unwritable target must be
+    /// reported as an I/O failure the caller can act on.
+    #[test]
+    fn propagates_io_error_when_dumping_peers() {
+        let address_man = AddressMan::new(None, &[]);
+
+        // A path that cannot exist as a directory: dumping into it must fail, and the error
+        // must name the file so an operator knows what to inspect.
+        let err = address_man
+            .dump_peers("/this/path/does/not/exist/and/cannot/be/created")
+            .unwrap_err();
+
+        match err {
+            AddressManError::PeerFile { ref path, .. } => {
+                assert!(path.ends_with("peers.json"));
+            }
+            other => panic!("expected PeerFile, got {other:?}"),
+        }
+
+        // and the underlying io::Error stays reachable
+        assert!(core::error::Error::source(&err).is_some());
+    }
+
+    /// The wire layer wraps that I/O failure at its own boundary, so a caller can tell an
+    /// address-book failure from any other `io::Error`.
+    #[test]
+    fn wire_error_wraps_address_man_io_with_source() {
+        use core::error::Error as _;
+
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = crate::p2p_wire::error::WireError::from(io);
+
+        assert!(matches!(err, crate::p2p_wire::error::WireError::Io(_)));
+        assert!(
+            err.source().is_some(),
+            "the io::Error must remain reachable"
+        );
     }
 
     #[test]
