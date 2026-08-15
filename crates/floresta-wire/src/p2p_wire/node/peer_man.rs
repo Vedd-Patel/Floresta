@@ -38,6 +38,7 @@ use crate::node_handle::NodeResponse;
 use crate::node_handle::UserRequest;
 use crate::node_interface::PeerInfo;
 use crate::p2p_wire::error::WireError;
+use crate::p2p_wire::node::user_req::answer_user_request;
 use crate::p2p_wire::peer::PeerMessages;
 use crate::p2p_wire::peer::Version;
 
@@ -49,6 +50,72 @@ pub struct AddedPeerInfo {
 
     /// Whether we should allow V1 fallback for this connection
     pub(crate) v1_fallback: bool,
+}
+
+/// Errors that originate while managing the set of connected peers.
+///
+/// Peer management fails for reasons the caller can act on directly: there is nobody to ask,
+/// or the peer being referenced is not one we know. Keeping these separate from the rest of
+/// the wire errors means "we have no peers yet" reads differently from "the network broke".
+#[derive(Debug)]
+pub enum PeerManError {
+    /// No connected peer can serve this request.
+    ///
+    /// Usually transient during startup, before enough connections are established. The
+    /// caller should retry once more peers are available.
+    NoPeersAvailable {
+        /// The services the request needed, so a caller can tell "no peers at all" from
+        /// "no peers with compact filters".
+        needed: ServiceFlags,
+    },
+
+    /// We have peers, but none of them advertise utreexo support.
+    ///
+    /// The node cannot sync without a utreexo peer; this is worth surfacing to the operator
+    /// rather than retrying silently forever.
+    NoUtreexoPeersAvailable,
+
+    /// The referenced peer is not in our connection list.
+    PeerNotFound {
+        /// The peer id that was referenced.
+        peer: PeerId,
+    },
+
+    /// A peer at this address is already connected.
+    ///
+    /// Returned by `addnode` when the operator asks for a duplicate connection.
+    PeerAlreadyExists(LocalAddress),
+
+    /// No connected peer matches this address.
+    ///
+    /// Returned by `disconnectnode` when the operator names a peer we do not have.
+    PeerNotFoundAtAddress(BitcoinSocketAddr),
+}
+
+impl std::fmt::Display for PeerManError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPeersAvailable { needed } => {
+                write!(
+                    f,
+                    "no connected peer offers the services we need ({needed})"
+                )
+            }
+            Self::NoUtreexoPeersAvailable => {
+                write!(f, "no connected peer supports utreexo, so we cannot sync")
+            }
+            Self::PeerNotFound { peer } => write!(f, "peer {peer} is not connected"),
+            Self::PeerAlreadyExists(addr) => write!(f, "already connected to {addr}"),
+            Self::PeerNotFoundAtAddress(addr) => write!(f, "no connected peer at {addr}"),
+        }
+    }
+}
+
+impl std::error::Error for PeerManError {
+    /// These describe the state of our peer set rather than wrapping a lower-level failure.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
 }
 
 impl<T, Chain> UtreexoNode<Chain, T>
@@ -94,8 +161,8 @@ where
         let dist = WeightedIndex::new(&weights).ok()?;
         let idx = dist.sample(&mut rand::rng());
 
-        let (id, peer, _) = candidates[idx];
-        Some((id, peer))
+        let (id, peer, _) = candidates.get(idx)?;
+        Some((*id, *peer))
     }
 
     /// Whether the node was configured with a fixed peer list (via `--connect`).
@@ -126,9 +193,11 @@ where
         request: NodeRequest,
         required_service: ServiceFlags,
     ) -> Result<PeerId, WireError> {
-        let (peer_id, peer) = self
-            .choose_peer_by_latency(required_service)
-            .ok_or(WireError::NoPeersAvailable)?;
+        let (peer_id, peer) = self.choose_peer_by_latency(required_service).ok_or(
+            PeerManError::NoPeersAvailable {
+                needed: required_service,
+            },
+        )?;
 
         peer.channel.send(request)?;
 
@@ -136,26 +205,36 @@ where
     }
 
     #[inline]
-    #[allow(clippy::expect_used, reason = "INVARIANT: we checked that peers isn't empty")]
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: we checked that peers isn't empty"
+    )]
     pub(crate) fn send_to_random_peer(
         &mut self,
         req: NodeRequest,
         required_service: ServiceFlags,
     ) -> Result<u32, WireError> {
         if self.peers.is_empty() {
-            return Err(WireError::NoPeersAvailable);
+            return Err(PeerManError::NoPeersAvailable {
+                needed: required_service,
+            }
+            .into());
         }
 
         let peers = match required_service {
             ServiceFlags::NONE => &self.peer_ids,
-            _ => self
-                .peer_by_service
-                .get(&required_service)
-                .ok_or(WireError::NoPeersAvailable)?,
+            _ => self.peer_by_service.get(&required_service).ok_or(
+                PeerManError::NoPeersAvailable {
+                    needed: required_service,
+                },
+            )?,
         };
 
         if peers.is_empty() {
-            return Err(WireError::NoPeersAvailable);
+            return Err(PeerManError::NoPeersAvailable {
+                needed: required_service,
+            }
+            .into());
         }
 
         let peer = peers
@@ -164,10 +243,11 @@ where
 
         self.peers
             .get(peer)
-            .ok_or(WireError::NoPeersAvailable)?
+            .ok_or(PeerManError::NoPeersAvailable {
+                needed: required_service,
+            })?
             .channel
-            .send(req)
-            .map_err(WireError::ChannelSend)?;
+            .send(req)?;
 
         Ok(*peer)
     }
@@ -378,10 +458,7 @@ where
                     .inflight_user_requests
                     .remove(&UserRequest::Block(block))
                 {
-                    request
-                        .2
-                        .send(NodeResponse::Block(None))
-                        .map_err(|_| WireError::ResponseSendError)?;
+                    answer_user_request(request.2, NodeResponse::Block(None))?;
                 }
             }
 
@@ -390,13 +467,11 @@ where
                     .inflight_user_requests
                     .remove(&UserRequest::MempoolTransaction(tx))
                 {
-                    request
-                        .2
-                        .send(NodeResponse::MempoolTransaction(None))
-                        .map_err(|_| WireError::ResponseSendError)?;
+                    answer_user_request(request.2, NodeResponse::MempoolTransaction(None))?;
                 }
             }
-            _ => {}
+            // Witness txids and unknown inventory kinds are not tracked as user requests.
+            Inventory::WTx(_) | Inventory::Unknown { .. } => {}
         }
 
         Ok(())
@@ -411,10 +486,7 @@ where
             .inflight_user_requests
             .remove(&UserRequest::MempoolTransaction(txid))
         {
-            request
-                .2
-                .send(NodeResponse::MempoolTransaction(Some(tx)))
-                .map_err(|_| WireError::ResponseSendError)?;
+            answer_user_request(request.2, NodeResponse::MempoolTransaction(Some(tx)))?;
         }
 
         Ok(())
@@ -422,7 +494,10 @@ where
 
     /// Handles peer messages where behavior is common to all node contexts, returning `Some` only
     /// for peer messages that require context-specific handling.
-    #[allow(clippy::expect_used, reason = "INVARIANT: we just found it in inflight_user_requests")]
+    #[allow(
+        clippy::expect_used,
+        reason = "INVARIANT: we just found it in inflight_user_requests"
+    )]
     pub(crate) fn handle_peer_msg_common(
         &mut self,
         msg: PeerMessages,
@@ -459,7 +534,10 @@ where
 
                 match req {
                     Some(req) => {
-                        let final_req = self.inflight_user_requests.remove(&req).expect("BUG: we just found it in inflight_user_requests");
+                        let final_req = self
+                            .inflight_user_requests
+                            .remove(&req)
+                            .expect("BUG: we just found it in inflight_user_requests");
                         let _ = final_req.2.send(NodeResponse::CFilterHeaders(cfheaders));
                     }
 
@@ -471,7 +549,15 @@ where
 
                 Ok(None)
             }
-            _ => Ok(Some(msg)),
+            // Anything this handler does not consume is passed back to the caller's own
+            // dispatch. Enumerated so a new variant is reviewed here first.
+            PeerMessages::NewBlock(_)
+            | PeerMessages::Block(_)
+            | PeerMessages::Headers(_)
+            | PeerMessages::Ready(_)
+            | PeerMessages::Disconnected(_)
+            | PeerMessages::BlockFilter(_)
+            | PeerMessages::UtreexoProof(_) => Ok(Some(msg)),
         }
     }
 
@@ -549,7 +635,7 @@ where
             return Ok(());
         }
 
-        peer.banscore += factor;
+        peer.banscore = peer.banscore.saturating_add(factor);
 
         // This peer is misbehaving too often, ban it
         let is_misbehaving = peer.banscore >= self.common.max_banscore;
@@ -613,9 +699,25 @@ where
                 Some(req.clone())
             }
 
-            _ if now.duration_since(*time).as_secs() > T::REQUEST_TIMEOUT => Some(req.clone()),
+            InflightRequests::Headers
+            | InflightRequests::UtreexoState(_)
+            | InflightRequests::Blocks(_)
+            | InflightRequests::Connect(_)
+            | InflightRequests::GetFilters
+            | InflightRequests::UtreexoProof(_)
+            | InflightRequests::GetAddresses
+                if now.duration_since(*time).as_secs() > T::REQUEST_TIMEOUT =>
+            {
+                Some(req.clone())
+            }
 
-            _ => None,
+            InflightRequests::Headers
+            | InflightRequests::UtreexoState(_)
+            | InflightRequests::Blocks(_)
+            | InflightRequests::Connect(_)
+            | InflightRequests::GetFilters
+            | InflightRequests::UtreexoProof(_)
+            | InflightRequests::GetAddresses => None,
         };
 
         let timed_out = self
@@ -758,9 +860,7 @@ where
     }
 
     pub(crate) fn save_peers(&self) -> Result<(), WireError> {
-        self.address_man
-            .dump_peers(&self.datadir)
-            .map_err(WireError::Io)
+        Ok(self.address_man.dump_peers(&self.datadir)?)
     }
 
     /// Saves the utreexo peers to disk so we can reconnect with them later
@@ -768,16 +868,16 @@ where
         let peers: &Vec<u32> = self
             .peer_by_service
             .get(&service_flags::UTREEXO.into())
-            .ok_or(WireError::NoUtreexoPeersAvailable)?;
+            .ok_or(PeerManError::NoUtreexoPeersAvailable)?;
         let peers_usize: Vec<usize> = peers.iter().map(|&peer| peer as usize).collect();
         if peers_usize.is_empty() {
             warn!("No connected Utreexo peers to save to disk");
             return Ok(());
         }
         info!("Saving utreexo peers to disk...");
-        self.address_man
-            .dump_utreexo_peers(&self.datadir, &peers_usize)
-            .map_err(WireError::Io)
+        Ok(self
+            .address_man
+            .dump_utreexo_peers(&self.datadir, &peers_usize)?)
     }
 
     // === METRICS AND HELPERS ===
@@ -824,7 +924,15 @@ where
                 inflight.1
             }
 
-            _ => return None,
+            // These messages are not tied to a timed inflight request, so there is no
+            // round-trip to record.
+            PeerMessages::NewBlock(_)
+            | PeerMessages::Addr(_)
+            | PeerMessages::Disconnected(_)
+            | PeerMessages::NotFound(_)
+            | PeerMessages::Transaction(_)
+            | PeerMessages::UtreexoProof(_)
+            | PeerMessages::CFHeaders(_) => return None,
         };
 
         let elapsed = read_at.duration_since(sent_at).as_secs_f64();
@@ -911,7 +1019,7 @@ where
             .iter()
             .any(|peer_info| peer_address == peer_info.address)
         {
-            return Err(WireError::PeerAlreadyExists(local_address));
+            return Err(PeerManError::PeerAlreadyExists(local_address).into());
         }
 
         self.address_man.push_addresses(&[local_address]);
@@ -944,7 +1052,7 @@ where
             .added_peers
             .iter()
             .position(|info| addr == info.address)
-            .ok_or(WireError::PeerNotFoundAtAddress(addr))?;
+            .ok_or(PeerManError::PeerNotFoundAtAddress(addr))?;
 
         self.added_peers.remove(index);
 
@@ -958,7 +1066,7 @@ where
             .peers
             .iter()
             .find_map(|(&id, peer)| (*peer.address.as_bitcoin_socket_addr() == addr).then_some(id))
-            .ok_or(WireError::PeerNotFoundAtAddress(addr))?;
+            .ok_or(PeerManError::PeerNotFoundAtAddress(addr))?;
 
         self.send_to_peer(peer_id, NodeRequest::Shutdown)
     }
@@ -983,7 +1091,7 @@ where
             .iter()
             .any(|(_, peer_info)| *peer_info.address.as_bitcoin_socket_addr() == peer_address)
         {
-            return Err(WireError::PeerAlreadyExists(local_address));
+            return Err(PeerManError::PeerAlreadyExists(local_address).into());
         }
 
         local_address.set_services(ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS);
@@ -992,5 +1100,104 @@ where
         // Return true if exists or false if anything fails during connection
         // We allow V1 fallback iff the `v2` flag is not set
         self.open_connection(kind, local_address, !v2_transport)
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::wildcard_enum_match_arm,
+    reason = "test code: a panic is the assertion failing, which is the intent"
+)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use bitcoin::p2p::ServiceFlags;
+    use floresta_chain::ChainState;
+    use floresta_chain::FlatChainStore;
+    use floresta_common::Ema;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use super::*;
+    use crate::address_man::LocalAddress;
+    use crate::node::ConnectionKind;
+    use crate::node::LocalPeerView;
+    use crate::node::PeerStatus;
+    use crate::node::running_ctx::RunningNode;
+    use crate::p2p_wire::transport::TransportProtocol;
+
+    type TestNode = UtreexoNode<Arc<ChainState<FlatChainStore>>, RunningNode>;
+
+    fn peer_with(state: PeerStatus, services: ServiceFlags) -> LocalPeerView {
+        let (channel, _rx) = unbounded_channel();
+
+        LocalPeerView {
+            message_times: Ema::with_half_life_50(),
+            state,
+            channel,
+            services,
+            user_agent: "/test/".to_string(),
+            address: "127.0.0.1:8333".parse::<LocalAddress>().unwrap(),
+            _last_message: Instant::now(),
+            kind: ConnectionKind::Regular(ServiceFlags::NONE),
+            height: 0,
+            time_offset: 0,
+            banscore: 0,
+            transport_protocol: TransportProtocol::V1,
+        }
+    }
+
+    /// Sending to a peer whose reader has gone away must surface as
+    /// [`WireError::ChannelSend`], preserving the underlying send failure, rather than
+    /// being swallowed or panicking.
+    #[test]
+    fn propagates_channel_send_when_peer_is_gone() {
+        use core::error::Error as _;
+
+        let (channel, rx) = unbounded_channel::<NodeRequest>();
+        drop(rx);
+
+        let err = channel
+            .send(NodeRequest::GetAddresses)
+            .map_err(WireError::from)
+            .unwrap_err();
+
+        assert!(matches!(err, WireError::ChannelSend(_)));
+        assert!(
+            err.source().is_some(),
+            "the send failure must remain reachable"
+        );
+    }
+
+    /// A banned peer is never eligible, whatever it claims to support. This is the check
+    /// that keeps a misbehaving peer from being picked again after `increase_banscore`
+    /// pushes it over the threshold.
+    #[test]
+    fn banned_peers_are_never_selected() {
+        let banned = peer_with(PeerStatus::Banned, ServiceFlags::NETWORK);
+
+        assert!(!TestNode::is_peer_good(&banned, ServiceFlags::NONE));
+        assert!(!TestNode::is_peer_good(&banned, ServiceFlags::NETWORK));
+    }
+
+    /// A ready peer is eligible only when it advertises everything the caller needs, so a
+    /// request is never sent to a peer that cannot answer it.
+    #[test]
+    fn peers_are_selected_only_when_they_advertise_the_needed_services() {
+        let plain = peer_with(PeerStatus::Ready, ServiceFlags::NETWORK);
+
+        assert!(TestNode::is_peer_good(&plain, ServiceFlags::NONE));
+        assert!(TestNode::is_peer_good(&plain, ServiceFlags::NETWORK));
+        assert!(!TestNode::is_peer_good(
+            &plain,
+            ServiceFlags::COMPACT_FILTERS
+        ));
     }
 }
